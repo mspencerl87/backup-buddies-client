@@ -538,5 +538,13 @@ filegarden.net.
 2024), or `docker build .` in this folder. `install.sh` builds this same
 code from source; the published image is built from it too.
 
-**Security issues:** please report privately to support@filegarden.net
-rather than in a public issue.
+**Security issues:** please report privately to support@filegarden.net.
+
+**Bugs and ideas:** please use
+[backup-buddies-feedback](https://github.com/mspencerl87/backup-buddies-feedback/issues).
+For problems with your account, login or billing, use Contact support on
+your dashboard instead, so your details stay private.
+
+**Contributions:** pull requests aren't accepted yet. This repository is
+published from the maintainer's own, so changes merged here would be
+overwritten. You're welcome to fork it under the GPL.
