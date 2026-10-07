@@ -74,8 +74,11 @@ services:
       # opaque Docker volumes); any that don't exist yet are created.
       #
       # 1. Config: this device's identity key and small bookkeeping files.
-      #    Tiny. Keep it next to this file (the default, ./config) — not on
-      #    your data drive.
+      #    Keep it next to this file (the default, ./config) — not on your
+      #    data drive. While a file of 256 MB+ uploads it also holds a
+      #    temporary encrypted copy of it (so an interrupted upload can
+      #    resume), so its disk needs free space about the size of your
+      #    largest file; without that, big files just restart if cut off.
       - ${DATA_DIR_HOST:-./config}:/data
       # 2. Your files — what gets backed up. Mounted READ-ONLY: the client
       #    never writes anything into this folder. Falls back to an empty
