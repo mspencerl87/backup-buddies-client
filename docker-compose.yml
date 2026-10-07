@@ -1,0 +1,93 @@
+# Backup Buddies client — run this on the machine whose files you're
+# backing up. See the "Set up the client" page on your dashboard, or
+# apps/web/setup.html, for the full walkthrough.
+#
+# Easiest way to get this file (and everything else it needs) without
+# access to the project's private source repo:
+#   curl -fsSL https://app.filegarden.net/client/install.sh | bash
+#
+# Quick start once you have this directory:
+#   1. Copy .env.example to .env and fill in the values it asks for (from
+#      your dashboard's Devices card), including BACKUP_DIR_HOST if you
+#      want this device to back files up, not just receive them.
+#   2. docker compose up -d        (builds the image locally the first
+#                                    time — a few minutes — then starts it)
+#   3. docker compose logs -f   — you should see "registered this device's
+#      node id with the API", then (once your buddy's client is also
+#      running) a cycle line roughly every 30 seconds: "backup cycle
+#      complete" if there's something to send, or "nothing new to back up"
+#      if not. BACKUP_DIR is always set below (it just points at an empty
+#      folder when BACKUP_DIR_HOST isn't), so a receive-only device will
+#      show "nothing new to back up" every cycle rather than a separate
+#      "connectivity check" message — that's expected.
+#
+# To restore what a buddy is holding for you, use the local dashboard's
+# Restore button, or:
+#   docker compose run --rm client restore <buddy's node id>
+# (find their node id on your dashboard's Buddies card). Files land under
+# RESTORE_DIR_HOST/<buddy's node id>/ on this machine.
+#
+# A local status page — per-buddy pledge usage, what's been sent/received,
+# last backup cycle, and a one-click restore — is served at
+# http://<this machine's address>:8080 once the container is up (change
+# DASHBOARD_PORT in .env to use a different port). It has no login of its
+# own — see the network_mode note below if you want it restricted to this
+# machine instead of your LAN.
+
+services:
+  client:
+    build: .
+    # If you have access to the project's GitHub Container Registry
+    # package and it's been made public, pulling is faster than building:
+    # image: ghcr.io/yourusername/backup-buddies/client:latest
+    restart: unless-stopped
+    # Runs directly on this host's network instead of Docker's usual
+    # isolated bridge network. Two reasons this is necessary, not just
+    # convenient:
+    #   1. Local-network (mDNS) discovery — finding a buddy on the same
+    #      LAN directly, skipping the relay entirely — needs real access
+    #      to the host's network for multicast; a bridge-networked
+    #      container can't receive it no matter what ports are published.
+    #   2. It's what actually makes DASHBOARD_PORT/SYNC_PORT below mean
+    #      what they say: the app binds those ports directly on this
+    #      host, so no separate port-mapping step is needed (and none is
+    #      possible — Docker ignores a `ports:` list under this mode).
+    # Trade-off: the container loses Docker's network isolation — it sees
+    # (and can bind) this host's network directly, same as any other
+    # program running on this machine, rather than Docker managing what's
+    # exposed. Linux only — Docker Desktop (Mac/Windows) doesn't support
+    # host networking the same way; if that's you, drop this line and
+    # publish ports the usual way instead, with the understanding that
+    # mDNS/same-LAN direct connections won't work (everything still works
+    # via the relay or direct-over-internet, just not LAN-local).
+    network_mode: host
+    env_file: .env
+    environment:
+      # Fixed mount points inside the container. The *_HOST values in .env
+      # control which folders on this machine get mounted there, below.
+      - BACKUP_DIR=/backup
+      - BUDDY_FILES_DIR=/buddy-files
+      - RESTORE_DIR=/restored
+    volumes:
+      # Four separate folders, so the client's own files never end up mixed
+      # into your data. All are real, visible folders on this machine (not
+      # opaque Docker volumes); any that don't exist yet are created.
+      #
+      # 1. Config: this device's identity key and small bookkeeping files.
+      #    Tiny. Keep it next to this file (the default, ./config) — not on
+      #    your data drive.
+      - ${DATA_DIR_HOST:-./config}:/data
+      # 2. Your files — what gets backed up. Mounted READ-ONLY: the client
+      #    never writes anything into this folder. Falls back to an empty
+      #    folder when BACKUP_DIR_HOST isn't set (a receive-only device).
+      - ${BACKUP_DIR_HOST:-./empty-backup-dir}:/backup:ro
+      # 3. Buddy files — what your buddies store with you (encrypted; you
+      #    can't read them). This is the one that needs the space you
+      #    pledged, so point it at a dedicated folder on a drive that has
+      #    it. Use its own folder, never your own files' folder: the client
+      #    creates one subfolder per buddy in here.
+      - ${BUDDY_FILES_DIR_HOST:-./buddy-files}:/buddy-files
+      # 4. Restores — where files you restore from a buddy are written.
+      #    Kept apart from your files so a restore never overwrites
+      #    anything; copy back what you need yourself.
+      - ${RESTORE_DIR_HOST:-./restored}:/restored

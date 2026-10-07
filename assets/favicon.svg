@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="210 95 800 800">
+  <!-- Favicon tile: mark.svg's icon on a dark rounded-square background,
+       matching the brand's app-icon mockup. -->
+  <defs>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2EC5FF"/>
+      <stop offset="1" stop-color="#0878F9"/>
+    </linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#42E6A4"/>
+      <stop offset="1" stop-color="#08BBD4"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#168BFF"/>
+      <stop offset="1" stop-color="#35E5B5"/>
+    </linearGradient>
+  </defs>
+  <rect x="210" y="95" width="800" height="800" rx="160" fill="#0f1115"/>
+
+
+  <!-- top sync arrow -->
+  <path d="M315 300 C390 205 505 165 620 174 C700 180 765 207 822 250"
+        fill="none" stroke="url(#arrow)" stroke-width="52" stroke-linecap="round"/>
+  <path d="M808 204 L875 267 L786 270 Z" fill="#35E5B5"/>
+
+  <!-- bottom sync arrow -->
+  <path d="M885 695 C815 790 700 835 585 826 C505 820 440 790 383 748"
+        fill="none" stroke="url(#arrow)" stroke-width="52" stroke-linecap="round"/>
+  <path d="M397 795 L330 732 L420 728 Z" fill="#42E6A4"/>
+
+  <!-- left B / storage node -->
+  <path d="M235 320 H475
+           C555 320 600 365 600 425
+           C600 467 577 496 540 510
+           C586 524 610 559 610 608
+           C610 676 557 720 480 720
+           H235 Z
+           M300 385 V655 H472
+           C514 655 542 637 542 602
+           C542 567 514 550 472 550
+           H300 V485 H465
+           C500 485 525 469 525 435
+           C525 402 500 385 465 385 Z"
+        fill="url(#blue)" fill-rule="evenodd"/>
+
+  <!-- right B / storage node -->
+  <path d="M610 320 H850
+           C930 320 975 365 975 425
+           C975 467 952 496 915 510
+           C961 524 985 559 985 608
+           C985 676 932 720 855 720
+           H610 Z
+           M675 385 V655 H847
+           C889 655 917 637 917 602
+           C917 567 889 550 847 550
+           H675 V485 H840
+           C875 485 900 469 900 435
+           C900 402 875 385 840 385 Z"
+        fill="url(#teal)" fill-rule="evenodd"/>
+
+  <!-- server bays -->
+  <g fill="#263956">
+    <rect x="318" y="420" width="205" height="48" rx="18"/>
+    <rect x="318" y="490" width="205" height="48" rx="18"/>
+    <rect x="318" y="560" width="205" height="48" rx="18"/>
+    <rect x="693" y="420" width="205" height="48" rx="18"/>
+    <rect x="693" y="490" width="205" height="48" rx="18"/>
+    <rect x="693" y="560" width="205" height="48" rx="18"/>
+  </g>
+
+  <!-- status lights -->
+  <g fill="#29CFFF">
+    <circle cx="492" cy="444" r="12"/>
+    <circle cx="492" cy="514" r="12"/>
+    <circle cx="492" cy="584" r="12"/>
+  </g>
+  <g fill="#42E6A4">
+    <circle cx="867" cy="444" r="12"/>
+    <circle cx="867" cy="514" r="12"/>
+    <circle cx="867" cy="584" r="12"/>
+  </g>
+</svg>
