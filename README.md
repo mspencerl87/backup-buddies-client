@@ -101,10 +101,10 @@ instead of needing a terminal.
 network), so anyone who can reach this machine on that port can see your
 buddy/pledge info and trigger a restore. If this machine is reachable
 from somewhere you don't trust — the open internet, a shared or guest
-network — either restrict it to loopback (uncomment the `127.0.0.1:`
-version of the port mapping in `docker-compose.yml`) and reach it over
-SSH tunnel or VPN instead, or put a reverse proxy with auth in front of
-it.
+network — either restrict it to loopback (`DASHBOARD_BIND=127.0.0.1:8080`
+in `.env`; the compose file uses host networking, so there's no port
+mapping to edit) and reach it over SSH tunnel or VPN instead, or put a
+reverse proxy with auth in front of it.
 
 ## Restoring
 
@@ -517,8 +517,124 @@ poll, this client reports however many megabytes of relay traffic have
 accumulated since its last successful report, and only then advances its
 own internal "already reported" marker — so a failed poll re-reports the
 same bytes next cycle instead of losing them, and nothing is ever reported
-twice. Free-tier accounts are never billed for relay bandwidth, no matter
-how much of it they use.
+twice. Free-tier accounts are never billed for relay bandwidth. They get
+a monthly relay allowance instead (shown on the billing card); past it,
+buddy syncing pauses until the 1st of the next month, or until the
+account subscribes.
+
+## Commands and settings
+
+Everything you can run or set, in one place. The sections above explain
+the reasons behind most of it.
+
+### Commands
+
+Run these from the folder with your `docker-compose.yml` and `.env`.
+
+| Command | What it does |
+|---|---|
+| `curl -fsSL https://app.filegarden.net/client/install.sh \| bash` | Fresh install: creates `./backup-buddies-client/` with the source, compose file and an `.env` to fill in. Doesn't start anything |
+| `curl -fsSL https://app.filegarden.net/client/install.sh \| bash -s -- --update` | **`--update`**, the only flag the installer takes: updates an existing install in place, run from inside the install folder or the folder containing it. For image installs it pulls the latest image and restarts; for source installs it replaces only the code and rebuilds. It never touches `.env` or the data folders |
+| `docker compose up -d` | Start (or apply `.env` changes) |
+| `docker compose logs -f` | Follow the log (Ctrl+C to stop) |
+| `docker compose down` | Stop |
+| `docker compose pull && docker compose up -d` | Update an image install by hand |
+| `docker compose run --rm client restore <buddy node id> [dir]` | One-shot restore of everything that buddy holds for you, decrypted, then exits. `<buddy node id>` is required (Buddies card). `[dir]` is optional and is a path *inside the container*; the default is `/restored/<node id>`, which is `RESTORE_DIR_HOST/<node id>` on the host. Needs the same `BACKUP_PASSPHRASE` and a device token from the same account |
+| `cargo build --release` | Build from source (Rust 1.85+, edition 2024) |
+| `docker build -t backup-buddies-client .` | Build the image yourself |
+
+The client binary itself takes no flags. Its only subcommand is
+`restore`; with no arguments it runs as the normal background service.
+Everything else is set in `.env`.
+
+### Settings (`.env`)
+
+The client reads these once at startup, so restart after a change
+(`docker compose up -d`). `.env.example` has the same list with longer
+explanations.
+
+**Required**
+
+| Variable | What it is |
+|---|---|
+| `DEVICE_TOKEN` | From your account dashboard's Devices card ("Add device"). Shown once; if lost, remove the device there and add a new one |
+| `BACKUP_PASSPHRASE` | Encrypts everything before it leaves this machine. It never leaves this machine and **can't be recovered**. Under 12 characters logs a warning. To restore a backup on another device, that device needs the same passphrase |
+| `API_URL` | The service's API, `https://api.filegarden.net`. Leave as-is |
+
+**Folders** (on the host; mounted into the container at fixed paths)
+
+| Variable | Default | Container path | What it is |
+|---|---|---|---|
+| `BACKUP_DIR_HOST` | unset (receive-only device) | `/backup` (read-only) | Your files, which get backed up |
+| `BUDDY_FILES_DIR_HOST` | `./buddy-files` | `/buddy-files` | What buddies store with you (encrypted). Needs the space you pledged |
+| `RESTORE_DIR_HOST` | `./restored` | `/restored` | Where restores are written |
+| `DATA_DIR_HOST` | `./config` | `/data` | This device's identity key and bookkeeping. **Keep it**: losing it means a new identity |
+
+**Optional**
+
+| Variable | Default | What it does |
+|---|---|---|
+| `RELAY_URL` | `https://relay.filegarden.net` | Relay used when a direct connection isn't possible |
+| `PUID`, `PGID` | unset (runs as root) | Run as this user and group id (`id -u`, `id -g`), so files it creates are yours. `PGID` defaults to `PUID`. Needed for most NFS shares |
+| `DASHBOARD_PORT` | `8080` | Port for this device's status page |
+| `DASHBOARD_BIND` | `0.0.0.0:<DASHBOARD_PORT>` | Full address to listen on. `127.0.0.1:8080` keeps the page local to this machine |
+| `SYNC_PORT` | `11235` | UDP port for buddy connections. Forward it on your router for direct (non-relayed) connections |
+| `SCAN_INTERVAL_SECS` | `30` | How often to look for changes and sync, in seconds. At least 5 |
+| `STALE_AFTER_SECS` | `600`, or 3× the scan interval if longer | How long without a successful cycle before the dashboard calls a buddy stale |
+| `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder sync as "everything deleted". Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
+| `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every 6 hours). `off` disables the check |
+
+**Set by the image or compose file; don't set these yourself**
+
+| Variable | What it is |
+|---|---|
+| `BACKUP_DIR`, `BUDDY_FILES_DIR`, `RESTORE_DIR`, `DATA_DIR` | Container-side folder paths (`/backup`, `/buddy-files`, `/restored`, `/data`) |
+| `BB_INSTALL_KIND` | `image` for the published image, `source` for an `install.sh` build. Decides which update command the dashboard shows |
+
+### Status dashboard endpoints
+
+The page at `http://<machine>:8080` is backed by a small JSON API on the
+same port. It has **no authentication** (see "Status dashboard" above).
+`<node_id>` is a buddy's Iroh node id. Every `/api/buddies/...` call
+connects to that buddy live, and answers `502` if the buddy can't be
+reached.
+
+| Route | What it does |
+|---|---|
+| `GET /` | The dashboard page |
+| `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, and per-buddy pledges, usage, health and bandwidth |
+| `GET /api/buddies/<node_id>/files` | What that buddy holds for you right now |
+| `GET /api/buddies/<node_id>/disk` | That buddy's real disk space and total commitments |
+| `GET /api/buddies/<node_id>/versions?path=<path>` | Older saved copies of one file |
+| `POST /api/restore/<node_id>` | Restore to `RESTORE_DIR_HOST/<node_id>/`. Body `{"paths": [...]}`; empty or missing means everything |
+| `GET /api/buddies/<node_id>/restore-progress` | Progress of the latest restore from that buddy (`{"active": false}` if none) |
+| `POST /api/restore-version/<node_id>` | Restore one older copy. Body `{"path", "version"}`. It's written next to the normal restore with a suffix and never overwrites it |
+| `POST /api/buddies/<node_id>/purge` | "Delete permanently": body `{"path"}`. Asks the buddy to drop the saved copies of a file you've deleted. Refused while the file still exists |
+
+### What it sends to the service
+
+With `DEVICE_TOKEN` as a bearer token, and
+`User-Agent: backup-buddies-client/<version>`:
+
+| Call | When | Purpose |
+|---|---|---|
+| `GET /devices/me` | Startup, until it has succeeded once | Learns its account id, which is part of the encryption key. Saved in `DATA_DIR`, so later starts work even if the service is unreachable |
+| `PUT /devices/me/node-id` | Startup | Registers this device's Iroh node id so buddies can find it |
+| `GET /devices/me/buddies?relay_mb=<n>` | About every 30 s | Gets the buddies' node ids and pledges and whether the account is `paused`, and reports relay megabytes used since the last report |
+
+Plus the update check (above). File contents, names and the passphrase
+are never sent to the service.
+
+### Buddy-to-buddy protocol
+
+Clients talk to each other directly over Iroh (QUIC), ALPN
+`backup-buddies/sync/1`, falling back to the relay when needed. Each
+request is a framed message (`src/protocol.rs`): `Hello` (protocol
+version, currently 4), `Ping`, `Put` / `PutStream` / `PutResumable`
+(upload, the last one resumable for large files), `Delete`, `List` /
+`ListStream`, `Get`, `DiskStats`, `ListVersions`, `GetVersion` and
+`PurgeDeleted`. A buddy only ever lists, returns or deletes what the
+connecting device itself stored there, identified by its node id.
 
 ## License
 
