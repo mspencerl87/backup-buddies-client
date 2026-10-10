@@ -253,6 +253,8 @@ struct DiskStatus {
 struct LocalBackupStatus {
     file_count: usize,
     total_bytes: u64,
+    // Files and skipped folders the exclude list kept out (see excludes.rs).
+    excluded_count: usize,
 }
 
 #[derive(Serialize)]
@@ -517,7 +519,9 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
 
     let local_backup = match &state.backup_dir {
         Some(dir) => match crate::backup::local_backup_summary(dir).await {
-            Ok((file_count, total_bytes)) => Some(LocalBackupStatus { file_count, total_bytes }),
+            Ok((file_count, total_bytes, excluded_count)) => {
+                Some(LocalBackupStatus { file_count, total_bytes, excluded_count })
+            }
             Err(err) => {
                 tracing::warn!(?err, "failed to scan backup dir for dashboard");
                 None
@@ -1026,6 +1030,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="stat" id="local-files-stat" style="display:none;">
         <div class="label">Local files</div>
         <div class="value" id="local-files-count">…</div>
+        <div class="muted" id="local-files-excluded" style="display:none; font-size:0.85em;"
+          title="Files and folders skipped by your exclude list: excludes.txt in the config folder, plus the built-in list (Outlook PST/OST, live databases, VM disks, temp files)"></div>
       </div>
       <div class="stat" id="local-size-stat" style="display:none;">
         <div class="label">Local size</div>
@@ -2141,6 +2147,10 @@ async function refresh() {
     localFilesStat.style.display = "block";
     localSizeStat.style.display = "block";
     document.getElementById("local-files-count").textContent = data.local_backup.file_count;
+    const excludedEl = document.getElementById("local-files-excluded");
+    const excluded = data.local_backup.excluded_count || 0;
+    excludedEl.textContent = excluded + " excluded";
+    excludedEl.style.display = excluded ? "block" : "none";
     document.getElementById("local-files-size").textContent = fmtBytes(data.local_backup.total_bytes);
   } else {
     localFilesStat.style.display = "none";

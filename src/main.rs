@@ -11,6 +11,7 @@ mod receive;
 mod crypto;
 #[cfg(test)]
 mod e2e_tests;
+mod excludes;
 mod index;
 mod restore;
 mod update_check;
@@ -559,6 +560,7 @@ async fn main() -> Result<()> {
     index::open(&config.data_dir).context("failed to open the index in DATA_DIR")?;
     receive::clear_incoming(&config.buddy_files_dir).await;
     backup::init_spool(&config.data_dir).await;
+    excludes::init(&config.data_dir).await;
 
     // Remove buddies' backup copies (replaced or deleted content) once
     // they're VERSION_RETENTION_DAYS old: now, then daily.

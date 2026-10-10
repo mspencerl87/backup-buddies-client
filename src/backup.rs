@@ -243,6 +243,12 @@ pub async fn run_backup_cycle(
     if looks_like_missing_drive(local_files.len(), scan.unreadable.len(), sent.len())
         && !allow_empty_backup_dir()
     {
+        if scan.excluded > 0 {
+            anyhow::bail!(
+                "your exclude list (excludes.txt in the config folder) leaves nothing in your backup folder to                  back up, but {} file(s) from it are backed up with this buddy — not deleting them all.                  Check it for a pattern that's broader than you meant, like `*` or `**`.",
+                sent.len()
+            );
+        }
         anyhow::bail!(
             "your backup folder ({}) looks empty, but {} file(s) from it are backed up with this buddy — \
              not deleting them all. Is the drive with your files mounted? If you really did delete \
@@ -322,6 +328,15 @@ pub async fn run_backup_cycle(
         );
     }
     let to_delete = deletions_to_mirror(sent.keys(), &local_paths, scan.unreadable.len());
+    // Say why files the person didn't delete are leaving the buddy.
+    let newly_excluded = to_delete.iter().filter(|p| scan.rules.is_excluded(p)).count();
+    if newly_excluded > 0 {
+        tracing::info!(
+            buddy = %buddy_node_id,
+            files = newly_excluded,
+            "backed-up files are now excluded — removing them from this buddy (they keep a copy for 30 days)"
+        );
+    }
 
     // Nothing to send and nothing wrong locally: skip the connection (the
     // caller pings instead). With local failures, still connect, so the
@@ -1024,15 +1039,16 @@ async fn delete_one_file(conn: &iroh::endpoint::Connection, rel_path: &str) -> R
     Ok(())
 }
 
-/// File count and total (plaintext) bytes under `backup_dir` right now —
+/// File count, total (plaintext) bytes and excluded count (files plus
+/// skipped folders) under `backup_dir` right now —
 /// for the dashboard's "This Device" panel, not the sync protocol. A
 /// plain re-scan rather than anything manifest-based, since this is meant
 /// to show what's actually sitting in the directory, independent of
 /// whether it's been backed up to any particular buddy yet.
-pub async fn local_backup_summary(backup_dir: &Path) -> Result<(usize, u64)> {
-    let files = scan_local_files(backup_dir).await?.files;
-    let total_bytes = files.iter().map(|f| f.size).sum();
-    Ok((files.len(), total_bytes))
+pub async fn local_backup_summary(backup_dir: &Path) -> Result<(usize, u64, usize)> {
+    let scan = scan_local_files(backup_dir).await?;
+    let total_bytes = scan.files.iter().map(|f| f.size).sum();
+    Ok((scan.files.len(), total_bytes, scan.excluded))
 }
 
 /// One file found in BACKUP_DIR. `mtime_ns` is its modified time in
@@ -1049,10 +1065,14 @@ struct LocalFile {
 /// it couldn't open (relative paths). Unreadable entries matter: a folder
 /// the client isn't allowed to open looks exactly like a folder that was
 /// deleted, so callers must not treat "not in `files`" as "gone" while
-/// `unreadable` is non-empty.
+/// `unreadable` is non-empty. Excluded files are left out of `files`, so
+/// one that was backed up before is mirrored as deleted.
 struct LocalScan {
     files: Vec<LocalFile>,
     unreadable: Vec<String>,
+    /// Files and skipped folders the exclude list kept out.
+    excluded: usize,
+    rules: crate::excludes::Rules,
 }
 
 fn rel_to(backup_dir: &Path, abs_path: &Path) -> String {
@@ -1064,18 +1084,39 @@ fn rel_to(backup_dir: &Path, abs_path: &Path) -> String {
 }
 
 // Metadata only — no file contents are read here. Runs on a blocking
-// thread, since walking a large folder can take a while.
+// thread, since walking a large folder can take a while. The exclude list
+// is re-read each time, so edits apply on the next cycle.
 async fn scan_local_files(backup_dir: &Path) -> Result<LocalScan> {
     let backup_dir = backup_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || scan_local_files_blocking(&backup_dir))
-        .await
-        .context("folder scan task failed")
+    tokio::task::spawn_blocking(move || {
+        let rules = crate::excludes::Rules::load()?;
+        Ok(scan_local_files_blocking(&backup_dir, rules))
+    })
+    .await
+    .context("folder scan task failed")?
 }
 
-fn scan_local_files_blocking(backup_dir: &Path) -> LocalScan {
+fn scan_local_files_blocking(backup_dir: &Path, rules: crate::excludes::Rules) -> LocalScan {
     let mut out = Vec::new();
     let mut unreadable = Vec::new();
-    for entry in walkdir::WalkDir::new(backup_dir).follow_links(false) {
+    // A Cell since the folder filter below counts into it too.
+    let excluded = std::cell::Cell::new(0usize);
+    // Excluded folders aren't even opened (when no `!` line could bring
+    // something back from inside one): faster for things like .zfs or
+    // node_modules, and a locked "System Volume Information" no longer
+    // pauses deletions as unreadable.
+    let skip_folders = rules.can_skip_folders();
+    let walk = walkdir::WalkDir::new(backup_dir).follow_links(false).into_iter().filter_entry(|e| {
+        if !skip_folders || e.depth() == 0 || !e.file_type().is_dir() {
+            return true;
+        }
+        if rules.is_excluded(&rel_to(backup_dir, e.path())) {
+            excluded.set(excluded.get() + 1);
+            return false;
+        }
+        true
+    });
+    for entry in walk {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -1092,6 +1133,10 @@ fn scan_local_files_blocking(backup_dir: &Path) -> LocalScan {
         }
         let abs_path = entry.path().to_path_buf();
         let rel_path = rel_to(backup_dir, &abs_path);
+        if rules.is_excluded(&rel_path) {
+            excluded.set(excluded.get() + 1);
+            continue;
+        }
         let meta = entry.metadata().ok();
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let mtime_ns = meta
@@ -1101,7 +1146,7 @@ fn scan_local_files_blocking(backup_dir: &Path) -> LocalScan {
             .unwrap_or(-1);
         out.push(LocalFile { rel_path, abs_path, size, mtime_ns });
     }
-    LocalScan { files: out, unreadable }
+    LocalScan { files: out, unreadable, excluded: excluded.get(), rules }
 }
 
 /// True when BACKUP_DIR scanned completely (nothing unreadable) yet came
@@ -1172,6 +1217,27 @@ mod tests {
         let local: HashSet<&String> = [&present].into_iter().collect();
         assert_eq!(deletions_to_mirror(backed_up.iter(), &local, 0), vec!["photos/b.jpg".to_string()]);
         assert!(deletions_to_mirror(backed_up.iter(), &local, 1).is_empty());
+    }
+
+    #[test]
+    fn excluded_files_and_folders_are_left_out() {
+        let dir = tmp("excludes");
+        std::fs::create_dir_all(dir.join("mail")).unwrap();
+        std::fs::create_dir_all(dir.join("photos/.zfs/snapshot")).unwrap();
+        std::fs::write(dir.join("mail/inbox.PST"), b"x").unwrap();
+        std::fs::write(dir.join("mail/notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join("photos/a.jpg"), b"x").unwrap();
+        std::fs::write(dir.join("photos/.zfs/snapshot/a.jpg"), b"x").unwrap();
+        std::fs::write(dir.join("photos/a.iso"), b"x").unwrap();
+
+        let rules = crate::excludes::Rules::build("*.iso", true).unwrap();
+        let scan = scan_local_files_blocking(&dir, rules);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut names: Vec<&str> = scan.files.iter().map(|f| f.rel_path.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["mail/notes.txt", "photos/a.jpg"]);
+        // inbox.PST, a.iso, and the .zfs folder (skipped whole).
+        assert_eq!(scan.excluded, 3);
     }
 
     // Root ignores permissions, so this only proves anything when run as a

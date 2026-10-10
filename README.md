@@ -79,10 +79,60 @@ file, which is what this handles best.
   machine can be off, their disk can fail, and they can leave. Keep the
   originals.
 
-There's no exclude list yet: the client backs up everything in
-`BACKUP_DIR_HOST`, so keep what you don't want backed up outside it. Your
-buddy can see file names, paths and sizes (never contents), so don't put
-anything private in a file or folder name.
+The client skips the worst of these by default and lets you exclude
+anything else (see "Excluding files" below). Your buddy can see file
+names, paths and sizes (never contents), so don't put anything private in
+a file or folder name.
+
+## Excluding files (0.10.0)
+
+Everything in `BACKUP_DIR_HOST` is backed up except what the exclude list
+says. It works like Syncthing's `.stignore`, with two parts:
+
+**Built-in list.** Poor fits are skipped without you doing anything:
+
+| What | Patterns |
+|---|---|
+| Outlook mail stores | `*.pst`, `*.ost` |
+| Live databases and their journals | `*.db`, `*.db-wal`, `*.db-shm`, `*.db-journal`, `*.sqlite`, `*.sqlite3`, `*.sqlite-wal`, `*.sqlite-shm`, `*.sqlite-journal`, `*.mdf`, `*.ndf`, `*.ldf`, `*.ibd`, `*.ldb`, `*.laccdb` |
+| Virtual machine disks, checkpoints and memory | `*.vmdk`, `*.vhd`, `*.vhdx`, `*.avhd`, `*.avhdx`, `*.vdi`, `*.qcow`, `*.qcow2`, `*.hds`, `*.vmem`, `*.vmsn`, `*.vmss`, `*.vmrs` |
+| Temporary, lock and half-downloaded files | `*.tmp`, `~$*`, `.~lock.*#`, `*.swp`, `*.part`, `*.partial`, `*.crdownload` |
+| System files, trash and snapshot folders | `.DS_Store`, `._*`, `.Spotlight-V100`, `.Trashes`, `.fseventsd`, `.Trash-*`, `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `System Volume Information`, `hiberfil.sys`, `pagefile.sys`, `swapfile.sys`, `@eaDir`, `#recycle`, `.zfs` |
+
+Extensions are matched in any case (`.PST` too). Exports and finished
+files are deliberately *not* on the list: `.xva`, `.ova`, `.iso`, database
+dumps (`.sql`, `.bak`), Lightroom catalogs, encrypted containers and
+Access databases are all still backed up. `DEFAULT_EXCLUDES=off` in
+`.env` turns the built-in list off.
+
+**Your own list** is `excludes.txt` in the config folder
+(`DATA_DIR_HOST`, `./config` by default). The client creates it, with
+examples, the first time it starts. One pattern per line:
+
+| Pattern | Excludes |
+|---|---|
+| `*.iso` | any `.iso` file, in any folder |
+| `/Downloads` | the `Downloads` folder at the top of your backup folder only (and everything in it) |
+| `node_modules` | every folder named `node_modules`, at any depth |
+| `Photos/**/*.tmp` | `.tmp` files anywhere under `Photos` |
+| `(?i)*.mkv` | `.mkv` in any case (patterns are case-sensitive otherwise) |
+| `!*.pst` | nothing: it **brings back** `.pst` files the built-in list would skip |
+
+`*` matches within one folder, `**` across folders; `?`, `[a-z]` and
+`{jpg,png}` work too. Lines starting with `//` (or `# `) are comments. The
+**first** line that matches a file decides, and your list is checked
+before the built-in one, so a `!` line goes above whatever it makes an
+exception to. Edits apply on the next check; no restart needed. A line the
+client can't understand stops backups with an error naming the line,
+rather than being skipped. The dashboard shows how many files (and
+skipped folders) were excluded under **Local files**.
+
+**Excluding something that's already backed up removes it from your
+buddy**, the same way deleting it would: they keep the last copy for 30
+days (see "File versions"), then it's gone. The log says how many files
+that applies to. If your list would exclude everything while your buddy
+still holds files, the client stops and says so instead of removing them
+all.
 
 ## Running it
 
@@ -606,7 +656,7 @@ explanations.
 | `BACKUP_DIR_HOST` | unset (receive-only device) | `/backup` (read-only) | Your files, which get backed up |
 | `BUDDY_FILES_DIR_HOST` | `./buddy-files` | `/buddy-files` | What buddies store with you (encrypted). Needs the space you pledged |
 | `RESTORE_DIR_HOST` | `./restored` | `/restored` | Where restores are written |
-| `DATA_DIR_HOST` | `./config` | `/data` | This device's identity key and bookkeeping. **Keep it**: losing it means a new identity |
+| `DATA_DIR_HOST` | `./config` | `/data` | This device's identity key and bookkeeping, and `excludes.txt` (see "Excluding files"). **Keep it**: losing it means a new identity |
 
 **Optional**
 
@@ -619,6 +669,7 @@ explanations.
 | `SYNC_PORT` | `11235` | UDP port for buddy connections. Forward it on your router for direct (non-relayed) connections |
 | `SCAN_INTERVAL_SECS` | `30` | How often to look for changes and sync, in seconds. At least 5 |
 | `STALE_AFTER_SECS` | `600`, or 3× the scan interval if longer | How long without a successful cycle before the dashboard calls a buddy stale |
+| `DEFAULT_EXCLUDES` | on | `off` (or `false`, `0`, `no`) stops skipping the built-in list of poor fits (PST, live databases, VM disks, temp files). See "Excluding files" |
 | `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder sync as "everything deleted". Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
 | `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every 6 hours). `off` disables the check |
 
