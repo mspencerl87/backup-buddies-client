@@ -46,6 +46,44 @@ this still working" never depends on actually having something to send.
   and only ever lets *you* list or fetch back what *you* stored with
   them, never another buddy's data.
 
+## What to back up (and what not to)
+
+Backup Buddies is for keeping an **off-site copy** of files you'd hate to
+lose, on a buddy's machine somewhere else, so one dead disk, theft or
+house fire doesn't take your only copy. It works best with files that are
+written once or change now and then.
+
+**Good fits:** photos and videos, music, scans and paperwork, documents,
+finished projects, and exports made by other tools (VM backup files,
+database dumps, phone or app backups). Each export is a new, finished
+file, which is what this handles best.
+
+**Poor fits, and why:**
+
+- **Running VM disks and live databases.** They change while being read,
+  so the copy your buddy holds may not open or boot on restore. Back up
+  the VM's or database's own export or snapshot instead.
+- **Big files that change all the time** (Outlook PST files, photo
+  catalogs, encrypted containers). They work, but any change re-sends the
+  whole file: a 20 GB file changing daily is around 600 GB a month over
+  both your connections. If it goes through the relay, that counts toward
+  the free monthly relay allowance (syncing pauses past it until the 1st)
+  or is billed per GB on a paid plan. Fine if they rarely change.
+- **Things you can get back anyway:** caches, temp files, downloads,
+  games, OS and program folders. They just use up your buddy's pledge.
+- **Keeping your own devices in sync.** This is a one-way backup to
+  someone else's machine, checked every `SCAN_INTERVAL_SECS` (30 s by
+  default), and restoring is deliberate. Use a sync tool like Syncthing
+  for that.
+- **Your only copy of something.** This is the second copy. Your buddy's
+  machine can be off, their disk can fail, and they can leave. Keep the
+  originals.
+
+There's no exclude list yet: the client backs up everything in
+`BACKUP_DIR_HOST`, so keep what you don't want backed up outside it. Your
+buddy can see file names, paths and sizes (never contents), so don't put
+anything private in a file or folder name.
+
 ## Running it
 
 If you don't already have this directory (e.g. you don't have access to
