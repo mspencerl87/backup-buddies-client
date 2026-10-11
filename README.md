@@ -103,11 +103,16 @@ Extensions are matched in any case (`.PST` too). Exports and finished
 files are deliberately *not* on the list: `.xva`, `.ova`, `.iso`, database
 dumps (`.sql`, `.bak`), Lightroom catalogs, encrypted containers and
 Access databases are all still backed up. `DEFAULT_EXCLUDES=off` in
-`.env` turns the built-in list off.
+`.env` turns the built-in list off. To back up just one of these, copy its
+line from the bottom of `excludes.txt` above the marker with `!` in front,
+e.g. `!(?i)*.pst` (`(?i)` makes it match any case, like the built-in one).
 
 **Your own list** is `excludes.txt` in the config folder
 (`DATA_DIR_HOST`, `./config` by default). The client creates it, with
-examples, the first time it starts. One pattern per line:
+examples, the first time it starts. At the bottom it lists the built-in
+patterns as comments, under a marker line; the client rewrites that part at
+every start so it always matches what's applied, and never touches the lines
+above it. Add your patterns above the marker, one per line:
 
 | Pattern | Excludes |
 |---|---|
@@ -116,7 +121,7 @@ examples, the first time it starts. One pattern per line:
 | `node_modules` | every folder named `node_modules`, at any depth |
 | `Photos/**/*.tmp` | `.tmp` files anywhere under `Photos` |
 | `(?i)*.mkv` | `.mkv` in any case (patterns are case-sensitive otherwise) |
-| `!*.pst` | nothing: it **brings back** `.pst` files the built-in list would skip |
+| `!(?i)*.pst` | nothing: it **brings back** `.pst` files (any case) the built-in list would skip |
 
 `*` matches within one folder, `**` across folders; `?`, `[a-z]` and
 `{jpg,png}` work too. Lines starting with `//` (or `# `) are comments. The

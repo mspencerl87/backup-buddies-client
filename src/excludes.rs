@@ -20,7 +20,9 @@
 //! The person's own list lives in `DATA_DIR/excludes.txt` and is re-read
 //! every cycle, so edits apply without a restart. A built-in list of poor
 //! fits (see DEFAULTS) is checked after it, so a `!` line there can bring
-//! back any one default, and `DEFAULT_EXCLUDES=off` drops them all.
+//! back any one default, and `DEFAULT_EXCLUDES=off` drops them all. The
+//! built-in list is also written, as comments, at the bottom of that file
+//! (see with_builtin_list), so people can see what they'd be overriding.
 //!
 //! Excluding a file that was already backed up is mirrored like a delete:
 //! the buddy keeps the old content as a backup copy for 30 days, then it's
@@ -119,7 +121,8 @@ pub const DEFAULTS: &[(&str, &[&str])] = &[
 ];
 
 /// Written to DATA_DIR/excludes.txt the first time the client starts, so
-/// the file is there to edit next to the rest of the config.
+/// the file is there to edit next to the rest of the config. The built-in
+/// list is appended below it by with_builtin_list.
 const TEMPLATE: &str = "\
 // Files and folders in your backup folder that are never backed up.
 // One pattern per line, same rules as Syncthing's .stignore:
@@ -129,22 +132,66 @@ const TEMPLATE: &str = "\
 //   node_modules       every folder named node_modules (and everything in it)
 //   Photos/**/*.tmp    .tmp files anywhere under Photos
 //   (?i)*.mkv          case-insensitive: also matches .MKV
-//   !*.pst             back up .pst files after all (overrides the built-in list)
+//   !(?i)*.pst         back up .pst files after all (overrides the built-in list)
 //
 // `*` doesn't cross folders, `**` does. The first line that matches a file
 // decides, so put `!` lines above the patterns they make exceptions to.
 // Changes apply on the next check, no restart needed.
 //
-// A built-in list of poor fits is applied after this file: Outlook PST/OST,
-// live database files (*.db, *.sqlite, ...), virtual machine disks
-// (*.vmdk, *.vhdx, *.qcow2, ...), temp files and OS clutter. The client's
-// README has the full list. Bring one back with a `!` line here, or turn
-// the whole list off with DEFAULT_EXCLUDES=off in .env.
-//
 // Excluding something that's already backed up removes it from your
 // buddy the same way deleting it would: they keep the last copy for 30
 // days, then it's gone.
+//
+// Add your own patterns here, above the built-in list.
+
 ";
+
+/// Start of the part of excludes.txt the client owns. Everything from this
+/// line down is regenerated at startup from DEFAULTS, so the list people
+/// read is always the one actually applied, even after an update changes
+/// it (a copy written once would go stale).
+const BUILTIN_MARKER: &str =
+    "// ===== Built-in list: rewritten by the client at every start, edit above this line =====";
+
+/// `existing` (the file as it is, if any) with the built-in list section
+/// replaced by the current one. Lines above the marker are kept as they
+/// are; a file from before the marker existed keeps all of its lines.
+fn with_builtin_list(existing: Option<&str>, enabled: bool) -> String {
+    let own = match existing {
+        Some(text) => match text.find(BUILTIN_MARKER) {
+            Some(at) => &text[..at],
+            None => text,
+        },
+        None => TEMPLATE,
+    };
+    let mut out = own.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(BUILTIN_MARKER);
+    out.push('\n');
+    out.push_str(if enabled {
+        "//\n\
+         // Poor fits for an off-site backup, skipped after the lines above are\n\
+         // checked. They're comments here: the client applies them on its own. To\n\
+         // back one up anyway, copy its line above the marker with `!` in front\n\
+         // (e.g. `!(?i)*.pst`), or set DEFAULT_EXCLUDES=off in .env to back up all\n\
+         // of them. `(?i)` means any case: .PST as well as .pst.\n"
+    } else {
+        "//\n\
+         // DEFAULT_EXCLUDES=off is set in .env, so none of these are skipped right\n\
+         // now. Shown for reference; remove that setting to skip them again.\n"
+    });
+    for (why, patterns) in DEFAULTS {
+        out.push_str("//\n// ");
+        out.push_str(why);
+        out.push('\n');
+        for p in *patterns {
+            out.push_str("//   ");
+            out.push_str(p);
+            out.push('\n');
+        }
+    }
+    out
+}
 
 /// The file Rules::load reads; None (tests, the restore command) means
 /// built-in defaults only.
@@ -154,14 +201,26 @@ static PATH: OnceLock<PathBuf> = OnceLock::new();
 /// than every cycle for every buddy.
 static LAST_LOADED: Mutex<Option<String>> = Mutex::new(None);
 
-/// Points the exclude list at `DATA_DIR/excludes.txt`, writing the
-/// commented template there if it doesn't exist yet. Call once at startup.
+/// Points the exclude list at `DATA_DIR/excludes.txt`: creates it from the
+/// template if it doesn't exist yet, and brings its built-in list section
+/// up to date. Call once at startup.
 pub async fn init(data_dir: &Path) {
     let path = data_dir.join(FILE_NAME);
-    if tokio::fs::metadata(&path).await.is_err()
-        && let Err(err) = tokio::fs::write(&path, TEMPLATE).await
+    let existing = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            // Leave a file we can't read alone; Rules::load reports it.
+            tracing::warn!(path = %path.display(), ?err, "can't read the exclude list");
+            let _ = PATH.set(path);
+            return;
+        }
+    };
+    let updated = with_builtin_list(existing.as_deref(), defaults_enabled());
+    if existing.as_deref() != Some(updated.as_str())
+        && let Err(err) = tokio::fs::write(&path, &updated).await
     {
-        tracing::warn!(path = %path.display(), ?err, "couldn't create the exclude list template");
+        tracing::warn!(path = %path.display(), ?err, "couldn't update the exclude list file");
     }
     let _ = PATH.set(path);
 }
@@ -372,7 +431,7 @@ mod tests {
 
     #[test]
     fn user_lines_override_defaults() {
-        let r = Rules::build("!*.pst", true).unwrap();
+        let r = Rules::build("!(?i)*.pst", true).unwrap();
         assert!(!r.is_excluded("Outlook/archive.pst"));
         assert!(r.is_excluded("Outlook/archive.OST"));
         assert!(r.is_excluded("vms/win11.vhdx"));
@@ -400,8 +459,38 @@ mod tests {
     }
 
     #[test]
-    fn template_is_all_comments() {
-        let r = Rules::build(TEMPLATE, false).unwrap();
-        assert!(r.exclude.is_empty());
+    fn new_file_is_all_comments_and_lists_every_default() {
+        let text = with_builtin_list(None, true);
+        assert!(Rules::build(&text, false).unwrap().exclude.is_empty());
+        for (_, patterns) in DEFAULTS {
+            for p in *patterns {
+                assert!(text.contains(&format!("//   {p}\n")), "{p} missing");
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_section_is_refreshed_and_own_lines_kept() {
+        let mine = "// my list\n*.iso\n!(?i)*.pst\n";
+        let first = with_builtin_list(Some(mine), true);
+        assert!(first.starts_with(mine));
+        // Unchanged on the next start, so the file isn't rewritten.
+        assert_eq!(with_builtin_list(Some(&first), true), first);
+
+        // A stale section (older client, or edited by hand) is replaced.
+        let stale = format!("{mine}\n{BUILTIN_MARKER}\n//   *.old\n*.oops\n");
+        let fresh = with_builtin_list(Some(&stale), true);
+        assert_eq!(fresh, first);
+
+        let r = Rules::build(&fresh, true).unwrap();
+        assert!(r.is_excluded("a.iso"));
+        assert!(!r.is_excluded("Mail/ARCHIVE.PST"));
+        assert!(r.is_excluded("Mail/ARCHIVE.OST"));
+    }
+
+    #[test]
+    fn builtin_section_says_when_defaults_are_off() {
+        let text = with_builtin_list(None, false);
+        assert!(text.contains("DEFAULT_EXCLUDES=off is set"));
     }
 }
