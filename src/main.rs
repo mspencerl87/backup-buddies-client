@@ -15,6 +15,7 @@ mod crypto;
 mod e2e_tests;
 mod excludes;
 mod index;
+mod names;
 mod restore;
 mod update_check;
 
@@ -1299,6 +1300,14 @@ fn record_backup_activity(label: &str, stats: &backup::BackupCycleStats) {
         let mut parts = Vec::new();
         if stats.files_sent > 0 {
             parts.push(format!("Sent {} ({})", plural(stats.files_sent, "file"), fmt_bytes(stats.bytes_sent)));
+            // Upgrading to 0.14.0 re-sends everything once (see names.rs):
+            // say so, or it reads like the whole backup changed.
+            if stats.names_hidden > 0 {
+                parts.push(format!(
+                    "{} of them already backed up, sent again to hide their names",
+                    stats.names_hidden
+                ));
+            }
         }
         if stats.files_deleted > 0 {
             let why = match stats.newly_excluded {

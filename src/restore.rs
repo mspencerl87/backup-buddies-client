@@ -57,12 +57,56 @@ pub struct RestoreStats {
     pub traffic: Option<netinfo::ByteSplit>,
 }
 
+/// One file a buddy holds for us. `path` is its real path, read back from
+/// the name the buddy stores it under (`remote`, see names.rs), and is
+/// what the dashboard shows and sends back; `remote` stays on this side.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuddyFile {
+    pub path: String,
+    pub size: u64,
+    /// See `ListEntry::deleted`.
+    pub deleted: bool,
+    #[serde(skip)]
+    pub remote: String,
+}
+
+/// A buddy's listing with real paths. A file re-sent under its encrypted
+/// name (moving off a plaintext one from before 0.14.0) leaves its old
+/// copy behind as backup copies for 30 days, which would list it twice;
+/// the encrypted one wins, and History still finds the old copies (see
+/// `list_file_versions`).
+fn decode_listing(entries: Vec<ListEntry>) -> Vec<BuddyFile> {
+    let mut hidden = std::collections::HashSet::new();
+    let mut files: Vec<BuddyFile> = entries
+        .into_iter()
+        .map(|e| {
+            let decoded = crate::names::decrypt_path(&e.path);
+            if let crate::names::Decoded::Hidden(path) = &decoded {
+                hidden.insert(path.clone());
+            }
+            BuddyFile { path: decoded.display(&e.path), size: e.size, deleted: e.deleted, remote: e.path }
+        })
+        .collect();
+    files.retain(|f| crate::names::is_encrypted(&f.remote) || !hidden.contains(&f.path));
+    files
+}
+
 /// Connects to a buddy and asks what they're holding for us — no
-/// decryption, no writing to disk, just the file list (path + ciphertext
-/// size). Used by the dashboard's file browser to show what's available
-/// before the person picks what to restore, and by `run_restore` below to
-/// get the full list it then restores everything from.
+/// decryption of contents, no writing to disk, just the file list (path +
+/// ciphertext size). Used by the dashboard's file browser to show what's
+/// available before the person picks what to restore, and by
+/// reconciliation.
 pub async fn list_buddy_files(
+    endpoint: &Endpoint,
+    relay_url: &RelayUrl,
+    buddy_id: EndpointId,
+) -> Result<Vec<BuddyFile>> {
+    Ok(decode_listing(list_buddy_entries(endpoint, relay_url, buddy_id).await?))
+}
+
+/// The buddy's listing as it stores it: remote names, nothing merged.
+/// For reconciliation, which compares remote names.
+pub async fn list_buddy_entries(
     endpoint: &Endpoint,
     relay_url: &RelayUrl,
     buddy_id: EndpointId,
@@ -101,12 +145,19 @@ pub async fn list_file_versions(
     path: &str,
 ) -> Result<Vec<VersionEntry>> {
     let conn = connect(endpoint, relay_url, buddy_id).await?;
-    let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
-    protocol::write_frame(&mut send, &SyncRequest::ListVersions { path: path.to_string() }).await?;
-    send.finish().context("failed to finish send stream")?;
-    let resp: ListVersionsResponse =
-        protocol::read_frame(&mut recv).await.context("failed to read version list")?;
-    Ok(resp.versions)
+    // The first name with any copies: right after a file moved to its
+    // encrypted name, its older copies are still under the plaintext one.
+    for remote in crate::names::remote_candidates(path) {
+        let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
+        protocol::write_frame(&mut send, &SyncRequest::ListVersions { path: remote }).await?;
+        send.finish().context("failed to finish send stream")?;
+        let resp: ListVersionsResponse =
+            protocol::read_frame(&mut recv).await.context("failed to read version list")?;
+        if !resp.versions.is_empty() {
+            return Ok(resp.versions);
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// Restores one specific backup slot of one file — not the live copy.
@@ -125,17 +176,27 @@ pub async fn restore_version(
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Received);
 
-    let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
-    protocol::write_frame(&mut send, &SyncRequest::GetVersion { path: path.to_string(), version }).await?;
-    send.finish().context("failed to finish send stream")?;
-
-    let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read ack")?;
-    if !ack.ok {
-        anyhow::bail!("buddy could not serve that version: {}", ack.error.unwrap_or_default());
-    }
     let suffixed = format!("{path}.v{version}.bak");
     let Some(dest) = safe_join(restore_dir, &suffixed) else {
-        anyhow::bail!("buddy sent an unsafe path: {path:?}");
+        anyhow::bail!("unsafe path: {path:?}");
+    };
+    // Same order as list_file_versions: the copies History listed are
+    // under the first name that has any.
+    let mut error = String::new();
+    let mut found = None;
+    for remote in crate::names::remote_candidates(path) {
+        let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
+        protocol::write_frame(&mut send, &SyncRequest::GetVersion { path: remote, version }).await?;
+        send.finish().context("failed to finish send stream")?;
+        let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read ack")?;
+        if ack.ok {
+            found = Some(recv);
+            break;
+        }
+        error = ack.error.unwrap_or_default();
+    }
+    let Some(mut recv) = found else {
+        anyhow::bail!("buddy could not serve that version: {error}");
     };
     let ciphertext_len = receive_and_decrypt(&mut recv, dest, None).await?;
 
@@ -160,12 +221,17 @@ pub async fn purge_deleted(
     if crate::backup::buddy_protocol_version(&conn).await < 4 {
         anyhow::bail!("your buddy's client is too old for this — it'll work once they update (the copies are removed after 30 days anyway)");
     }
-    let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
-    protocol::write_frame(&mut send, &SyncRequest::PurgeDeleted { path: path.to_string() }).await?;
-    send.finish().context("failed to finish send stream")?;
-    let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read buddy's reply")?;
-    if !ack.ok {
-        anyhow::bail!("{}", ack.error.unwrap_or_else(|| "buddy refused".to_string()));
+    // Under every name it may have: a file that moved to its encrypted
+    // name can have copies under both. Removing nothing is fine; a name
+    // where the file still exists stops it.
+    for remote in crate::names::remote_candidates(path) {
+        let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
+        protocol::write_frame(&mut send, &SyncRequest::PurgeDeleted { path: remote }).await?;
+        send.finish().context("failed to finish send stream")?;
+        let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read buddy's reply")?;
+        if !ack.ok {
+            anyhow::bail!("{}", ack.error.unwrap_or_else(|| "buddy refused".to_string()));
+        }
     }
     Ok(())
 }
@@ -272,12 +338,13 @@ pub async fn run_restore(
     let started = std::time::Instant::now();
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Received);
-    let files = list_on(&conn).await?;
+    // Live files only: a deleted one is only backup copies, which a Get
+    // can't fetch.
+    let files: Vec<BuddyFile> = decode_listing(list_on(&conn).await?).into_iter().filter(|f| !f.deleted).collect();
     tracing::info!(count = files.len(), "buddy reports this many files on restore");
 
-    let paths: Vec<String> = files.into_iter().map(|f| f.path).collect();
     let (files_restored, bytes_restored) =
-        restore_paths_on(&conn, _passphrase, restore_dir, &paths, None).await?;
+        restore_paths_on(&conn, _passphrase, restore_dir, &files, None).await?;
     Ok(RestoreStats {
         files_restored,
         bytes_restored,
@@ -287,7 +354,7 @@ pub async fn run_restore(
     })
 }
 
-/// Same as `run_restore`, but only the given paths (as returned by
+/// Same as `run_restore`, but only the given files (from
 /// `list_buddy_files`) rather than everything — what the dashboard uses
 /// for every restore it kicks off (a plain "Restore", "Restore all",
 /// "Restore selected", and a folder's "Restore" all resolve to a path
@@ -304,14 +371,14 @@ pub async fn restore_selected(
     _passphrase: &SecretString,
     buddy_id: EndpointId,
     restore_dir: &Path,
-    paths: &[String],
+    files: &[BuddyFile],
     progress: Option<ProgressHandle>,
 ) -> Result<RestoreStats> {
     let started = std::time::Instant::now();
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Received);
     let (files_restored, bytes_restored) =
-        restore_paths_on(&conn, _passphrase, restore_dir, paths, progress.as_ref()).await?;
+        restore_paths_on(&conn, _passphrase, restore_dir, files, progress.as_ref()).await?;
     Ok(RestoreStats {
         files_restored,
         bytes_restored,
@@ -329,23 +396,23 @@ async fn restore_paths_on(
     conn: &iroh::endpoint::Connection,
     _passphrase: &SecretString,
     restore_dir: &Path,
-    paths: &[String],
+    files: &[BuddyFile],
     progress: Option<&ProgressHandle>,
 ) -> Result<(usize, u64)> {
     let mut restored = 0;
     let mut attempted = 0;
     let mut bytes = 0u64;
-    for rel_path in paths {
+    for file in files {
         if let Some(p) = progress
             && let Ok(mut g) = p.lock() {
-                g.current_path = Some(rel_path.clone());
+                g.current_path = Some(file.path.clone());
             }
-        match restore_one_file(conn, restore_dir, rel_path, progress).await {
+        match restore_one_file(conn, restore_dir, file, progress).await {
             Ok(ciphertext_len) => {
                 restored += 1;
                 bytes += ciphertext_len;
             }
-            Err(err) => tracing::warn!(path = %rel_path, ?err, "failed to restore file"),
+            Err(err) => tracing::warn!(path = %file.path, ?err, "failed to restore file"),
         }
         attempted += 1;
         // completed_files tracks files *attempted*, not just successes —
@@ -367,14 +434,14 @@ async fn restore_paths_on(
 async fn restore_one_file(
     conn: &iroh::endpoint::Connection,
     restore_dir: &Path,
-    rel_path: &str,
+    file: &BuddyFile,
     progress: Option<&ProgressHandle>,
 ) -> Result<u64> {
-    let Some(dest) = safe_join(restore_dir, rel_path) else {
-        anyhow::bail!("buddy sent an unsafe path in its file list: {rel_path:?}");
+    let Some(dest) = safe_join(restore_dir, &file.path) else {
+        anyhow::bail!("buddy sent an unsafe path in its file list: {:?}", file.path);
     };
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
-    protocol::write_frame(&mut send, &SyncRequest::Get { path: rel_path.to_string() }).await?;
+    protocol::write_frame(&mut send, &SyncRequest::Get { path: file.remote.clone() }).await?;
     send.finish().context("failed to finish send stream")?;
 
     let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read ack")?;

@@ -152,6 +152,44 @@ fn expires_unix(kept: std::time::SystemTime) -> Option<u64> {
     (kept + retention()).duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
 }
 
+/// Removes empty folders from a sender's live files (not `.versions/` or
+/// `.incoming/`, which have their own tidying). Senders only ever store
+/// files, so an empty folder is one a delete left behind, and its name is
+/// all that's left of what was there: a client before 0.14.0 sent real
+/// folder names, which would otherwise stay visible here after its files
+/// moved to encrypted names. Clients before 0.14.0 also never removed
+/// these on delete, so the daily sweep catches what they left.
+fn remove_empty_folders(sender_dir: &Path) {
+    fn walk(dir: &Path, top: bool) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if top && (name == ".versions" || name == INCOMING_DIR) {
+                continue;
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let path = entry.path();
+                walk(&path, false);
+                // Only succeeds when empty.
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+    walk(sender_dir, true);
+}
+
+/// After a delete: removes the folders it left empty, up to (not
+/// including) the sender's own folder. See remove_empty_folders.
+async fn remove_emptied_parents(sender_dir: &Path, removed: &Path) {
+    let mut dir = removed.parent().map(Path::to_path_buf);
+    while let Some(d) = dir {
+        if d == sender_dir || !d.starts_with(sender_dir) || tokio::fs::remove_dir(&d).await.is_err() {
+            break;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+}
+
 /// Removes backup copies older than VERSION_RETENTION_DAYS from every
 /// sender's `.versions/`, and the folders that leaves empty. Returns how
 /// many files and bytes went. Run at startup and daily (main.rs).
@@ -167,6 +205,7 @@ pub async fn expire_versions(buddy_files_dir: &Path) -> (usize, u64) {
         let Ok(senders) = std::fs::read_dir(&root) else { return removed };
         let now = std::time::SystemTime::now();
         for sender in senders.flatten() {
+            remove_empty_folders(&sender.path());
             let versions = sender.path().join(".versions");
             if !versions.is_dir() {
                 continue;
@@ -582,7 +621,15 @@ async fn commit_upload(
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await.context("failed to create directory for incoming file")?;
     }
-    tokio::fs::rename(tmp, dest).await.context("failed to store incoming file")?;
+    if let Err(err) = tokio::fs::rename(tmp, dest).await {
+        // A delete on another connection can remove the folder as it
+        // empties (remove_emptied_parents) between the two steps: once more.
+        let Some(parent) = dest.parent().filter(|_| err.kind() == std::io::ErrorKind::NotFound) else {
+            return Err(err).context("failed to store incoming file");
+        };
+        tokio::fs::create_dir_all(parent).await.context("failed to create directory for incoming file")?;
+        tokio::fs::rename(tmp, dest).await.context("failed to store incoming file")?;
+    }
     if let Some(remote) = sender_dir.file_name().and_then(|n| n.to_str()) {
         crate::activity::incoming_stored(remote, bytes_received);
     }
@@ -1069,6 +1116,7 @@ async fn handle_delete(
             return Ok(());
         }
     }
+    remove_emptied_parents(sender_dir, &target).await;
 
     if freed > 0 {
         {
@@ -1422,6 +1470,27 @@ mod tests {
         assert!(staging.join(RESUME_DIR).join("abc.part").exists(), "a fresh resumable partial is kept");
         assert!(staging.join(RESUME_DIR).join("abc.json").exists());
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_only_empty_live_folders() {
+        let root = std::env::temp_dir().join(format!("bb-empty-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sender = root.join("some-buddy");
+        // Left by a delete from a client before 0.14.0: real folder names.
+        std::fs::create_dir_all(sender.join("Photos/2024")).unwrap();
+        std::fs::create_dir_all(sender.join("n1/abc")).unwrap();
+        std::fs::write(sender.join("n1/abc/def"), b"x").unwrap();
+        std::fs::create_dir_all(sender.join(".incoming/resume")).unwrap();
+        std::fs::create_dir_all(sender.join(".versions/Taxes")).unwrap();
+        std::fs::write(sender.join(".versions/Taxes/a.pdf.v1"), b"x").unwrap();
+
+        expire_versions(&root).await;
+        assert!(!sender.join("Photos").exists(), "empty folders go");
+        assert!(sender.join("n1/abc/def").exists(), "folders with files stay");
+        assert!(sender.join(".incoming/resume").exists(), "staging is left alone");
+        assert!(sender.join(".versions/Taxes/a.pdf.v1").exists(), "backup copies keep until they expire");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // The startup correction for a drifted usage ledger: only live files

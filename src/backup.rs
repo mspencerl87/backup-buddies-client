@@ -67,6 +67,10 @@ pub struct BackupCycleStats {
     pub deleted_paths: Vec<String>,
     pub newly_excluded: usize,
     pub new_refusals: Vec<(String, &'static str)>,
+    /// Files that were on the buddy under their real names (sent before
+    /// 0.14.0) and went again this cycle under encrypted ones. Included in
+    /// `files_sent`.
+    pub names_hidden: usize,
 }
 
 const ACTIVITY_PATHS: usize = 200;
@@ -85,6 +89,9 @@ pub struct CycleProgress {
     pub files_total: usize,
     pub files_checked: usize,
     pub files_to_send: usize,
+    /// How many of `files_to_send` are already on the buddy under their
+    /// real names and only go again to hide them (see names.rs).
+    pub files_hiding_names: usize,
     pub files_sent: usize,
     pub bytes_to_send: u64,
     /// Bytes of fully finished files; the current file's share is added
@@ -287,11 +294,27 @@ pub async fn run_backup_cycle(
     // modified time differs from what the index recorded last time. For an
     // unchanged folder a cycle is a metadata-only listing, however big the
     // files are.
-    let mut to_put: Vec<(String, PathBuf, u64, String)> = Vec::new();
+    let mut to_put: Vec<Upload> = Vec::new();
+    let mut new_refusals = Vec::new();
     for (checked, f) in local_files.iter().enumerate() {
         // Cheap per-file update (one lock, one field) — drives the
         // dashboard's "checked N of M" while a big folder is first read.
         tracker.update(|p| p.files_checked = checked);
+        // A name too long to encrypt within filename limits is refused up
+        // front, like rclone does, rather than truncated. It stays in
+        // local_paths, so a copy sent before 0.14.0 isn't deleted.
+        if let Err(err) = crate::names::check(&f.rel_path) {
+            let reason = err.message();
+            if note_refusal(&buddy_node_id, &f.rel_path, reason) {
+                tracing::warn!(path = %f.rel_path, reason, "can't back up this file with hidden names — skipping it");
+                new_refusals.push((f.rel_path.clone(), reason));
+            }
+            files_failed += 1;
+            if failed_paths.len() < MAX_FAILED_PATHS_SHOWN {
+                failed_paths.push(FailedFile { path: f.rel_path.clone(), reason: Some(reason) });
+            }
+            continue;
+        }
         let sha256 = match idx.cached_hash(&f.rel_path, f.size, f.mtime_ns)? {
             Some(hash) => hash,
             None => {
@@ -320,9 +343,21 @@ pub async fn run_backup_cycle(
                 }
             }
         };
-        let changed = sent.get(&f.rel_path).is_none_or(|e| e.sha256 != sha256 || e.size != f.size);
-        if changed {
-            to_put.push((f.rel_path.clone(), f.abs_path.clone(), f.size, sha256));
+        let prev = sent.get(&f.rel_path);
+        let changed = prev.is_some_and(|e| e.sha256 != sha256 || e.size != f.size);
+        // Sent before 0.14.0 under its real name: goes again under the
+        // encrypted one, and the old copy is deleted after.
+        let hide_name = prev.is_some_and(|e| e.name_scheme == crate::names::SCHEME_PLAIN);
+        if prev.is_none() || changed || hide_name {
+            to_put.push(Upload {
+                remote: crate::names::encrypt_path(&f.rel_path).expect("names::check passed above"),
+                rel_path: f.rel_path.clone(),
+                abs_path: f.abs_path.clone(),
+                size: f.size,
+                sha256,
+                resend: changed,
+                hide_name,
+            });
         }
     }
 
@@ -349,10 +384,14 @@ pub async fn run_backup_cycle(
         );
     }
 
+    // Plaintext-named copies of files already re-sent under encrypted
+    // names, left over when deleting one failed last time.
+    let mut old_names = idx.old_names(&buddy_node_id)?;
+
     // Nothing to send and nothing wrong locally: skip the connection (the
     // caller pings instead). With local failures, still connect, so the
     // dashboard's reachability/staleness stays based on a real connection.
-    if to_put.is_empty() && to_delete.is_empty() && files_failed == 0 {
+    if to_put.is_empty() && to_delete.is_empty() && old_names.is_empty() && files_failed == 0 {
         return Ok(BackupCycleStats::default());
     }
 
@@ -375,15 +414,16 @@ pub async fn run_backup_cycle(
     tracker.update(|p| {
         p.phase = "sending";
         p.files_to_send = to_put.len();
-        p.bytes_to_send = to_put.iter().map(|(_, _, size, _)| *size).sum();
+        p.files_hiding_names = to_put.iter().filter(|u| u.hide_name && !u.resend).count();
+        p.bytes_to_send = to_put.iter().map(|u| u.size).sum();
         p.files_to_delete = to_delete.len();
         p.sending_started_unix = Some(crate::dashboard::unix_now());
     });
 
     let mut put_count = 0;
+    let mut names_hidden = 0;
     let mut sent_paths = Vec::new();
-    let mut new_refusals = Vec::new();
-    for (rel_path, abs_path, size, sha256) in &to_put {
+    for Upload { rel_path, abs_path, size, sha256, remote, resend, hide_name } in &to_put {
         tracker.start_file(rel_path, *size);
         if !streaming && *size > protocol::LEGACY_PUT_MAX_BYTES {
             files_failed += 1;
@@ -404,6 +444,7 @@ pub async fn run_backup_cycle(
                 &conn,
                 &buddy_node_id,
                 rel_path,
+                remote,
                 abs_path,
                 *size,
                 sha256,
@@ -412,9 +453,9 @@ pub async fn run_backup_cycle(
             )
             .await
         } else if streaming {
-            put_one_file(&conn, rel_path, abs_path, *size, Some(&tracker.counter)).await
+            put_one_file(&conn, remote, abs_path, *size, Some(&tracker.counter)).await
         } else {
-            put_one_file_legacy(&conn, rel_path, abs_path, *size).await
+            put_one_file_legacy(&conn, remote, abs_path, *size).await
         };
         // A failed file still moves the file count on (failures are listed
         // separately), but its bytes come off the total instead of counting
@@ -439,18 +480,26 @@ pub async fn run_backup_cycle(
                 // Recorded per file as it lands (one row, not a rewrite of
                 // everything), so a cycle interrupted partway only re-sends
                 // the file that was in flight.
-                if let Err(err) = idx.record_sent(
-                    &buddy_node_id,
-                    rel_path,
-                    &SentEntry { size: *size, sha256: sha256.clone(), ciphertext_size },
-                ) {
+                let entry = SentEntry {
+                    size: *size,
+                    sha256: sha256.clone(),
+                    ciphertext_size,
+                    name_scheme: crate::names::SCHEME_N1,
+                };
+                let recorded = if *hide_name {
+                    names_hidden += 1;
+                    old_names.push(rel_path.clone());
+                    idx.record_name_hidden(&buddy_node_id, rel_path, &entry)
+                } else {
+                    idx.record_sent(&buddy_node_id, rel_path, &entry)
+                };
+                if let Err(err) = recorded {
                     tracing::warn!(path = %rel_path, ?err, "backed up file but failed to record it — may be re-sent next cycle");
                 }
                 // Already on this buddy, so this was a change re-sending the
                 // whole file — counted for the dashboard's re-send warning.
-                if sent.contains_key(rel_path)
-                    && let Err(err) = idx.record_resend(&buddy_node_id, rel_path, *size)
-                {
+                // Re-sends that only hide a name aren't: they happen once.
+                if *resend && let Err(err) = idx.record_resend(&buddy_node_id, rel_path, *size) {
                     tracing::debug!(path = %rel_path, ?err, "couldn't record a re-send");
                 }
             }
@@ -483,7 +532,11 @@ pub async fn run_backup_cycle(
     let mut delete_count = 0;
     let mut deleted_paths = Vec::new();
     for rel_path in &to_delete {
-        let result = delete_one_file(&conn, rel_path).await;
+        let scheme = sent.get(rel_path).map_or(crate::names::SCHEME_N1, |e| e.name_scheme);
+        let result = match crate::names::remote_path(rel_path, scheme) {
+            Ok(remote) => delete_one_file(&conn, &remote).await,
+            Err(err) => Err(anyhow::anyhow!(err.message())),
+        };
         tracker.update(|p| p.files_deleted += 1);
         match result {
             Ok(()) => {
@@ -505,6 +558,24 @@ pub async fn run_backup_cycle(
         }
     }
 
+    // The plaintext-named copies of files just re-sent under encrypted
+    // names (plus any a dropped connection left last time). The buddy
+    // keeps them as backup copies for 30 days like any delete, so nothing
+    // is gone at once; they're not in the Activity count, since the files
+    // themselves weren't deleted.
+    for rel_path in &old_names {
+        match delete_one_file(&conn, rel_path).await {
+            Ok(()) => {
+                if let Err(err) = idx.forget_old_name(&buddy_node_id, rel_path) {
+                    tracing::debug!(path = %rel_path, ?err, "couldn't record an old name as deleted");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(path = %rel_path, ?err, "couldn't delete a file's old plaintext-named copy from the buddy — will retry next cycle")
+            }
+        }
+    }
+
 
     // Read straight off the connection's own QUIC stats rather than
     // summing what we think we sent — covers protocol overhead (framing,
@@ -522,7 +593,11 @@ pub async fn run_backup_cycle(
         deleted_paths,
         newly_excluded,
         new_refusals,
+        names_hidden,
     };
+    if names_hidden > 0 {
+        tracing::info!(buddy = %buddy_node_id, files = names_hidden, "re-sent files that were stored under their real names, now under encrypted ones");
+    }
     Ok(stats)
 }
 
@@ -575,7 +650,9 @@ pub async fn reconcile_with_buddy(
         return Ok(ReconcileStats::default());
     }
 
-    let buddy_files = crate::restore::list_buddy_files(endpoint, relay_url, buddy_id)
+    // The buddy's own names (encrypted, or plaintext from before 0.14.0),
+    // compared against where each file we sent should be.
+    let buddy_files = crate::restore::list_buddy_entries(endpoint, relay_url, buddy_id)
         .await
         .context("failed to list buddy's files for reconciliation")?;
 
@@ -587,13 +664,16 @@ pub async fn reconcile_with_buddy(
         buddy_files.iter().filter(|f| !f.deleted).map(|f| (f.path.as_str(), f.size)).collect();
 
     let checked = sent.len();
-    let missing_on_buddy: Vec<String> = sent
-        .iter()
-        .filter(|(path, entry)| {
-            !buddy_live.get(path.as_str()).is_some_and(|&size| size == entry.ciphertext_size)
-        })
-        .map(|(path, _)| path.clone())
-        .collect();
+    let mut expected = HashSet::with_capacity(sent.len());
+    let mut missing_on_buddy = Vec::new();
+    for (path, entry) in &sent {
+        let remote = crate::names::remote_path(path, entry.name_scheme).ok();
+        let there = remote.as_deref().and_then(|r| buddy_live.get(r));
+        if there != Some(&entry.ciphertext_size) {
+            missing_on_buddy.push(path.clone());
+        }
+        expected.extend(remote);
+    }
     // Dropping them from the index makes the very next ordinary cycle see
     // those local files as changed and re-send them.
     if !missing_on_buddy.is_empty() {
@@ -601,10 +681,13 @@ pub async fn reconcile_with_buddy(
             .context("failed to record reconciliation result")?;
     }
 
+    // Plaintext-named copies still queued for deletion are expected too:
+    // the next cycle removes them.
+    let old_names: HashSet<String> = idx.old_names(&buddy_node_id)?.into_iter().collect();
     let unexpected_on_buddy: Vec<String> = buddy_live
         .keys()
-        .filter(|path| !sent.contains_key(**path))
-        .map(|path| path.to_string())
+        .filter(|remote| !expected.contains(**remote) && !old_names.contains(**remote))
+        .map(|remote| crate::names::decrypt_path(remote).display(remote))
         .collect();
 
     Ok(ReconcileStats { checked, missing_on_buddy, unexpected_on_buddy })
@@ -660,6 +743,9 @@ pub async fn init_spool(data_dir: &Path) {
 /// once the copy is complete; only then can it be resumed from.
 #[derive(Serialize, serde::Deserialize)]
 struct SpoolMeta {
+    /// The remote (encrypted) path it's going to. A copy made before
+    /// 0.14.0 has the plaintext path here, so it doesn't match and is
+    /// redone under the new name.
     path: String,
     plaintext_sha256: String,
     plaintext_len: u64,
@@ -713,13 +799,13 @@ async fn spool_has_room(dir: &Path, bytes: u64) -> bool {
 async fn start_resumable(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
-    rel_path: &str,
+    remote_path: &str,
     upload_id: &str,
     ciphertext_len: u64,
 ) -> Result<u64> {
     protocol::write_frame(
         send,
-        &SyncRequest::PutResumable { path: rel_path.to_string(), upload_id: upload_id.to_string(), ciphertext_len },
+        &SyncRequest::PutResumable { path: remote_path.to_string(), upload_id: upload_id.to_string(), ciphertext_len },
     )
     .await?;
     let reply: protocol::PutResumeReply =
@@ -758,6 +844,7 @@ async fn put_one_file_resumable(
     conn: &iroh::endpoint::Connection,
     buddy: &str,
     rel_path: &str,
+    remote: &str,
     abs_path: &Path,
     plaintext_len: u64,
     plaintext_sha256: &str,
@@ -765,7 +852,7 @@ async fn put_one_file_resumable(
     bytes_skipped: Option<&Arc<AtomicU64>>,
 ) -> Result<u64> {
     let Some(dir) = SPOOL_DIR.get() else {
-        return put_one_file(conn, rel_path, abs_path, plaintext_len, bytes_sent).await;
+        return put_one_file(conn, remote, abs_path, plaintext_len, bytes_sent).await;
     };
     let (ct_path, meta_path) = spool_paths(dir, buddy, rel_path);
 
@@ -773,13 +860,13 @@ async fn put_one_file_resumable(
     let existing = tokio::fs::read(&meta_path).await.ok().and_then(|b| serde_json::from_slice::<SpoolMeta>(&b).ok());
     if let Some(meta) = existing {
         let ct_len = tokio::fs::metadata(&ct_path).await.map(|m| m.len()).ok();
-        if meta.path == rel_path
+        if meta.path == remote
             && meta.plaintext_sha256 == plaintext_sha256
             && meta.plaintext_len == plaintext_len
             && meta.ciphertext_sha256.is_some()
             && ct_len == Some(meta.ciphertext_len)
         {
-            let result = send_from_spool(conn, &meta, &ct_path, bytes_sent, bytes_skipped).await;
+            let result = send_from_spool(conn, rel_path, &meta, &ct_path, bytes_sent, bytes_skipped).await;
             if result.is_ok() || drop_spool_after(result.as_ref().err()) {
                 remove_spool(&ct_path, &meta_path).await;
             }
@@ -790,9 +877,9 @@ async fn put_one_file_resumable(
 
     if !spool_has_room(dir, plaintext_len).await {
         tracing::info!(path = %rel_path, "not enough free space in DATA_DIR for a resumable copy — sending without one");
-        return put_one_file(conn, rel_path, abs_path, plaintext_len, bytes_sent).await;
+        return put_one_file(conn, remote, abs_path, plaintext_len, bytes_sent).await;
     }
-    let result = spool_and_send(conn, rel_path, abs_path, plaintext_len, plaintext_sha256, &ct_path, &meta_path, bytes_sent).await;
+    let result = spool_and_send(conn, rel_path, remote, abs_path, plaintext_len, plaintext_sha256, &ct_path, &meta_path, bytes_sent).await;
     if result.is_ok() || drop_spool_after(result.as_ref().err()) {
         remove_spool(&ct_path, &meta_path).await;
     }
@@ -811,6 +898,7 @@ fn drop_spool_after(err: Option<&anyhow::Error>) -> bool {
 /// sends the rest.
 async fn send_from_spool(
     conn: &iroh::endpoint::Connection,
+    rel_path: &str,
     meta: &SpoolMeta,
     ct_path: &Path,
     bytes_sent: Option<&Arc<AtomicU64>>,
@@ -820,7 +908,7 @@ async fn send_from_spool(
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     let offset = start_resumable(&mut send, &mut recv, &meta.path, &meta.upload_id, meta.ciphertext_len).await?;
     if offset > 0 {
-        tracing::info!(path = %meta.path, offset, total = meta.ciphertext_len, "resuming upload");
+        tracing::info!(path = %rel_path, offset, total = meta.ciphertext_len, "resuming upload");
     }
     #[cfg(test)]
     TEST_LAST_RESUME_OFFSET.store(offset, Ordering::Relaxed);
@@ -858,6 +946,7 @@ async fn send_from_spool(
 async fn spool_and_send(
     conn: &iroh::endpoint::Connection,
     rel_path: &str,
+    remote: &str,
     abs_path: &Path,
     plaintext_len: u64,
     plaintext_sha256: &str,
@@ -879,10 +968,10 @@ async fn spool_and_send(
     let upload_id = new_upload_id(rel_path);
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     // Refused (pledge full…) before a byte is encrypted to disk.
-    let offset = start_resumable(&mut send, &mut recv, rel_path, &upload_id, ciphertext_len).await?;
+    let offset = start_resumable(&mut send, &mut recv, remote, &upload_id, ciphertext_len).await?;
 
     let mut meta = SpoolMeta {
-        path: rel_path.to_string(),
+        path: remote.to_string(),
         plaintext_sha256: plaintext_sha256.to_string(),
         plaintext_len,
         upload_id,
@@ -949,9 +1038,9 @@ async fn spool_and_send(
 /// bounded memory whatever its size. Returns the encrypted size stored on
 /// the buddy's side, which the index records for the dashboard and for
 /// reconciliation.
-async fn put_one_file(
+pub(crate) async fn put_one_file(
     conn: &iroh::endpoint::Connection,
-    rel_path: &str,
+    remote_path: &str,
     abs_path: &Path,
     plaintext_len: u64,
     bytes_sent: Option<&Arc<AtomicU64>>,
@@ -971,7 +1060,7 @@ async fn put_one_file(
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(
         &mut send,
-        &SyncRequest::PutStream { path: rel_path.to_string(), ciphertext_len },
+        &SyncRequest::PutStream { path: remote_path.to_string(), ciphertext_len },
     )
     .await?;
 
@@ -1027,7 +1116,7 @@ pub(crate) async fn buddy_protocol_version(conn: &iroh::endpoint::Connection) ->
 /// Callers keep this to files under LEGACY_PUT_MAX_BYTES.
 async fn put_one_file_legacy(
     conn: &iroh::endpoint::Connection,
-    rel_path: &str,
+    remote_path: &str,
     abs_path: &Path,
     plaintext_len: u64,
 ) -> Result<u64> {
@@ -1043,7 +1132,7 @@ async fn put_one_file_legacy(
     protocol::write_frame(
         &mut send,
         &SyncRequest::Put {
-            path: rel_path.to_string(),
+            path: remote_path.to_string(),
             ciphertext_len,
             ciphertext_sha256: hex::encode(Sha256::digest(&ciphertext)),
         },
@@ -1059,9 +1148,9 @@ async fn put_one_file_legacy(
     Ok(ciphertext_len)
 }
 
-async fn delete_one_file(conn: &iroh::endpoint::Connection, rel_path: &str) -> Result<()> {
+async fn delete_one_file(conn: &iroh::endpoint::Connection, remote_path: &str) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
-    protocol::write_frame(&mut send, &SyncRequest::Delete { path: rel_path.to_string() }).await?;
+    protocol::write_frame(&mut send, &SyncRequest::Delete { path: remote_path.to_string() }).await?;
     send.finish().context("failed to finish send stream")?;
 
     let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read ack")?;
@@ -1091,6 +1180,20 @@ struct LocalFile {
     abs_path: PathBuf,
     size: u64,
     mtime_ns: i64,
+}
+
+/// A file going to a buddy this cycle.
+struct Upload {
+    rel_path: String,
+    /// Where the buddy stores it (names.rs).
+    remote: String,
+    abs_path: PathBuf,
+    size: u64,
+    sha256: String,
+    /// Already on the buddy with other content (for the re-send warning).
+    resend: bool,
+    /// Already on the buddy under its real name: delete that copy after.
+    hide_name: bool,
 }
 
 /// What a scan of BACKUP_DIR found: the files it could see, plus anything

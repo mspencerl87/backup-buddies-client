@@ -1,6 +1,6 @@
 [package]
 name = "backup-buddies-client"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["Spencer LeBlanc"]
@@ -18,6 +18,11 @@ age = "0.12.1"
 # Only for the Stanza/FileKey types in crypto.rs's lazily derived old key
 # (age doesn't re-export them). Same version age itself uses.
 age-core = "0.12"
+# File and folder names as a buddy stores them (src/names.rs): deterministic
+# authenticated encryption (RFC 5297), so a file always gets the same
+# remote name. 0.7 is the aes 0.8 / cipher 0.4 generation age and iroh
+# already pull in; only cmac and dbl are new.
+aes-siv = { version = "0.7", default-features = false, features = ["alloc"] }
 anyhow = "1.0.104"
 # Local status/restore dashboard (dashboard.rs) — plain axum, no templating
 # engine; the one page it serves is a small embedded HTML/JS string.

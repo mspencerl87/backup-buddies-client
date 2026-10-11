@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bandwidth::{BandwidthBook, BandwidthTotals};
 use crate::netinfo::ConnectionQuality;
-use crate::protocol::ListEntry;
+use crate::restore::BuddyFile;
 use crate::receive::{self, PledgeBook};
 
 // Brand assets, shared with apps/web/assets (the canonical copy — see
@@ -931,15 +931,14 @@ async fn restore_handler(
         }
     };
     let wanted: std::collections::HashSet<&str> = requested.iter().map(|s| s.as_str()).collect();
-    let selected: Vec<ListEntry> = all_files
+    let selected: Vec<BuddyFile> = all_files
         .into_iter()
         .filter(|f| !f.deleted && (requested.is_empty() || wanted.contains(f.path.as_str())))
         .collect();
     let total_bytes: u64 = selected.iter().map(|f| f.size).sum();
-    let paths: Vec<String> = selected.into_iter().map(|f| f.path).collect();
 
     let progress: crate::restore::ProgressHandle = Arc::new(Mutex::new(crate::restore::RestoreProgress {
-        total_files: paths.len(),
+        total_files: selected.len(),
         total_bytes,
         started_unix: unix_now(),
         ..Default::default()
@@ -952,7 +951,7 @@ async fn restore_handler(
         &state.passphrase,
         buddy_id,
         &restore_dir,
-        &paths,
+        &selected,
         Some(progress.clone()),
     )
     .await;
@@ -1554,6 +1553,9 @@ function describeCycleProgress(p) {
   const done = Math.min(p.bytes_to_send, p.bytes_sent + p.current_done);
   const frac = p.bytes_to_send > 0 ? done / p.bytes_to_send : (p.files_to_send > 0 ? p.files_sent / p.files_to_send : 0);
   let line = "Backing up " + n(Math.min(p.files_sent + 1, p.files_to_send)) + " of " + n(p.files_to_send) + " file(s)";
+  // After upgrading to 0.14.0, files already backed up go once more under
+  // encrypted names; without this it looks like everything changed.
+  if (p.files_hiding_names > 0) line += " (" + n(p.files_hiding_names) + " to hide their names)";
   if (p.bytes_to_send > 0) {
     line += " — " + fmtBytes(done) + " of " + fmtBytes(p.bytes_to_send) + " (" + Math.floor(frac * 100) + "%)";
     const elapsed = p.sending_started_unix ? p.now_unix - p.sending_started_unix : 0;

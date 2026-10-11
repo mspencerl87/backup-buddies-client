@@ -56,6 +56,8 @@ pub struct Keys {
     v1: LazyIdentity,
     /// For files encrypted straight to the passphrase (client ≤0.4.x).
     legacy: age::scrypt::Identity,
+    /// AES-SIV key for file and folder names (see names.rs).
+    name_key: [u8; 64],
 }
 
 static KEYS: OnceLock<Keys> = OnceLock::new();
@@ -68,26 +70,61 @@ pub fn init(passphrase: &SecretString, account_id: &str) -> Result<()> {
         return Ok(());
     }
     let salt = format!("{KDF_SALT_PREFIX}{account_id}");
-    let identity = derive_identity(passphrase, salt.as_bytes())?;
+    let mut secret = derive_secret(passphrase, salt.as_bytes());
+    let identity = identity_from_secret(&secret);
+    let name_key = name_key_from_secret(&secret);
+    secret.fill(0);
+    let identity = identity?;
     let recipient = identity.to_public();
     let v1 = LazyIdentity { passphrase: passphrase.clone(), key: OnceLock::new() };
     let legacy = age::scrypt::Identity::new(passphrase.clone());
-    let _ = KEYS.set(Keys { recipient, identity, v1, legacy });
+    let _ = KEYS.set(Keys { recipient, identity, v1, legacy, name_key });
     Ok(())
 }
 
-fn derive_identity(passphrase: &SecretString, salt: &[u8]) -> Result<age::x25519::Identity> {
+/// The slow passphrase step. The file key and the name key both come from
+/// these 32 bytes.
+fn derive_secret(passphrase: &SecretString, salt: &[u8]) -> [u8; 32] {
     let mut secret = [0u8; 32];
     let params = scrypt::Params::new(KDF_LOG_N, KDF_R, KDF_P, 32).expect("valid scrypt params");
     scrypt::scrypt(passphrase.expose_secret().as_bytes(), salt, &params, &mut secret)
         .expect("32-byte output is valid");
+    secret
+}
 
+fn derive_identity(passphrase: &SecretString, salt: &[u8]) -> Result<age::x25519::Identity> {
+    let mut secret = derive_secret(passphrase, salt);
+    let identity = identity_from_secret(&secret);
+    secret.fill(0);
+    identity
+}
+
+fn identity_from_secret(secret: &[u8; 32]) -> Result<age::x25519::Identity> {
     // age only builds an X25519 identity from its text form, so encode the
     // derived bytes the way age itself does.
     let hrp = bech32::Hrp::parse("age-secret-key-").expect("valid HRP");
-    let encoded = bech32::encode::<bech32::Bech32>(hrp, &secret).expect("encodable key");
-    secret.fill(0);
+    let encoded = bech32::encode::<bech32::Bech32>(hrp, secret).expect("encodable key");
     encoded.to_uppercase().parse().map_err(|e: &str| anyhow::anyhow!("deriving file key: {e}"))
+}
+
+/// Domain-separates the name key from the file key. Changing it (or the
+/// scrypt salt) orphans every name already on a buddy, same as changing
+/// the file key orphans the contents.
+const NAME_KEY_LABEL: &[u8] = b"backup-buddies/name-key/v1\0";
+
+/// The name key: a labelled hash of the same scrypt output, so the same
+/// passphrase and account give every name back on a rebuilt device, and
+/// the age key's bytes are never used for anything else. The input is
+/// already a uniformly random key, so one SHA-512 is a sound derivation
+/// (HKDF's extract step adds nothing here) and gives AES-SIV its 64 bytes.
+fn name_key_from_secret(secret: &[u8; 32]) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+    let mut hasher = Sha512::new();
+    hasher.update(NAME_KEY_LABEL);
+    hasher.update(secret);
+    let mut key = [0u8; 64];
+    key.copy_from_slice(&hasher.finalize());
+    key
 }
 
 /// The fixed-salt (v1) key, derived the first time a file isn't for the
@@ -118,6 +155,11 @@ impl age::Identity for LazyIdentity {
 
 pub fn keys() -> &'static Keys {
     KEYS.get().expect("crypto::init must run at startup")
+}
+
+/// The AES-SIV key names.rs encrypts file and folder names with.
+pub(crate) fn name_key() -> &'static [u8; 64] {
+    &keys().name_key
 }
 
 /// Exact encrypted size of a file, given the length of its age header +
@@ -365,6 +407,17 @@ pub(crate) mod tests {
         // Same passphrase on another account: a different key.
         let other = independent_key(format!("{KDF_SALT_PREFIX}00000000-0000-4000-8000-000000000002").as_bytes());
         assert!(age::decrypt(&other, &a).is_err());
+    }
+
+    #[test]
+    fn name_key_comes_from_the_passphrase_and_isnt_the_file_key() {
+        setup();
+        let pass = SecretString::from(TEST_PASSPHRASE.to_string());
+        let secret = derive_secret(&pass, format!("{KDF_SALT_PREFIX}{TEST_ACCOUNT}").as_bytes());
+        assert_eq!(&name_key_from_secret(&secret), name_key(), "re-derivable on a rebuilt device");
+        assert!(!name_key().windows(32).any(|w| w == secret), "the age key's bytes aren't reused");
+        let other = derive_secret(&pass, format!("{KDF_SALT_PREFIX}00000000-0000-4000-8000-000000000002").as_bytes());
+        assert_ne!(&name_key_from_secret(&other), name_key(), "another account, other names");
     }
 
     #[tokio::test(flavor = "multi_thread")]

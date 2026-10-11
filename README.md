@@ -45,7 +45,9 @@ this still working" never depends on actually having something to send.
 - **Does not:** let your buddy read your data. Their client stores
   whatever bytes you send it verbatim, without trying to decrypt them —
   and only ever lets *you* list or fetch back what *you* stored with
-  them, never another buddy's data.
+  them, never another buddy's data. Since 0.14.0 file and folder names
+  are encrypted too (see "Encrypted file names" below); your buddy still
+  sees sizes and how your folders are laid out.
 
 ## What to back up (and what not to)
 
@@ -81,9 +83,49 @@ file, which is what this handles best.
   originals.
 
 The client skips the worst of these by default and lets you exclude
-anything else (see "Excluding files" below). Your buddy can see file
-names, paths and sizes (never contents), so don't put anything private in
-a file or folder name.
+anything else (see "Excluding files" below). Your buddy can't see file
+contents or names, but does see sizes and how many files and folders
+there are.
+
+## Encrypted file names (0.14.0)
+
+Your buddy stores your files under encrypted names, so they can't see
+what your files or folders are called. Each part of a path is encrypted
+on its own, the way rclone's crypt remote does it:
+`Photos/2024/IMG_0001.jpg` is stored as `n1/<name>/<name>/<name>`, where
+each `<name>` is a long string of lowercase letters and digits.
+
+- **How:** AES-SIV (RFC 5297), which always gives the same name for the
+  same input, so a file keeps one name on your buddy's disk and
+  overwrites, backup copies and deletes work as before. Each name is
+  padded to a multiple of 16 bytes first, so exact name lengths are
+  hidden too. The key comes from your passphrase and account, like the
+  file key, so restoring on a rebuilt device brings the names back.
+- **What your buddy still sees:** file sizes, how deep your folders go
+  and how many entries each folder has, how many files you have, and
+  when they change. Like rclone, the same name in two folders encrypts
+  the same way, so your buddy can tell that two folders share a name
+  without knowing what it is.
+- **Long names:** a file or folder name longer than 127 bytes (127
+  characters in plain English, fewer with accented or non-Latin
+  characters) can't fit within filename limits once encrypted. That file
+  isn't backed up: it shows as failed on the dashboard, with the reason,
+  and once in Activity. Shorten the name and it goes out next cycle.
+  Very deep folder trees can hit the same limit.
+- **Updating from an older client:** the first cycle after updating
+  re-sends every file that's already backed up, under its new name, then
+  deletes the copy with the plaintext name. That costs the bandwidth of
+  one full upload; the progress line and Activity say why. Your buddy
+  doesn't need to update for this. Their copies of older versions (from
+  before the update) keep their plaintext names until they're removed
+  after 30 days. History still finds them. Buddies on 0.14.0 also
+  remove the empty plaintext folders left behind.
+- **On the buddy's side**, the dashboard and logs show encrypted names
+  for what you store with them, which is the point.
+
+Changing how names are encrypted would orphan every name already on a
+buddy, so it's versioned: `n1` is scheme 1, and anything on a buddy that
+isn't under `n1/` is a plaintext path from an older client.
 
 ## Excluding files (0.10.0)
 
@@ -389,9 +431,10 @@ Config (`DATA_DIR`):
 Buddy files (`BUDDY_FILES_DIR`):
 
 - `<buddy node id>/` — the actual files a buddy has backed up with you,
-  stored encrypted and under the same relative paths they back them up
-  with on their end. This device never attempts to decrypt them — it has
-  no reason to ever hold the sender's passphrase.
+  stored encrypted, under `n1/` with encrypted file and folder names
+  (buddies on clients before 0.14.0 send their real relative paths).
+  This device never attempts to decrypt them — it has no reason to ever
+  hold the sender's passphrase.
 - `<buddy node id>/.versions/` — backup slots for that buddy's files,
   kept when a file is overwritten or deleted (see "File versions" below).
   Deleting this folder just gives up that recovery history; it doesn't
@@ -801,7 +844,9 @@ version, currently 4), `Ping`, `Put` / `PutStream` / `PutResumable`
 (upload, the last one resumable for large files), `Delete`, `List` /
 `ListStream`, `Get`, `DiskStats`, `ListVersions`, `GetVersion` and
 `PurgeDeleted`. A buddy only ever lists, returns or deletes what the
-connecting device itself stored there, identified by its node id.
+connecting device itself stored there, identified by its node id. Paths
+are opaque to the buddy: since 0.14.0 the sender sends encrypted names
+(see "Encrypted file names"), which needed no protocol change.
 
 ## License
 

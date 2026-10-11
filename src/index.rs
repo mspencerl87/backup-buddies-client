@@ -11,7 +11,10 @@
 //!   BACKUP_DIR, so a scan only re-reads a file when its size or modified
 //!   time changed. Shared by all buddies.
 //! - `sent`: per buddy, what we last sent them for each path (plaintext
-//!   size + hash, and the encrypted size they store) — the old manifest.
+//!   size + hash, the encrypted size they store, and whether its name is
+//!   hidden — see names.rs) — the old manifest. Keyed by the real path.
+//! - `old_names`: per buddy, plaintext paths of files already re-sent
+//!   under encrypted names whose old copy still has to be deleted there.
 //! - `resends`: one row each time a file already on a buddy was sent
 //!   again because it changed, kept for RESEND_HISTORY_DAYS — for the
 //!   dashboard's "keeps re-sending" warning (any change re-sends the whole
@@ -70,6 +73,9 @@ pub struct SentEntry {
     /// Encrypted size stored on the buddy's side — what the dashboard shows
     /// and reconciliation compares against the buddy's own listing.
     pub ciphertext_size: u64,
+    /// How the buddy names it (names.rs): SCHEME_PLAIN for files sent
+    /// before 0.14.0, which are re-sent under encrypted names.
+    pub name_scheme: u8,
 }
 
 pub struct Index {
@@ -137,9 +143,23 @@ impl Index {
                  buddy   TEXT,
                  text    TEXT NOT NULL,
                  details TEXT
+             );
+             CREATE TABLE IF NOT EXISTS old_names (
+                 buddy TEXT NOT NULL,
+                 path  TEXT NOT NULL,
+                 PRIMARY KEY (buddy, path)
              );",
         )
         .context("failed to set up the index")?;
+        // 0.14.0: which name scheme each sent file uses. Rows from before
+        // it are plaintext names (0).
+        let has_scheme = conn
+            .prepare("SELECT 1 FROM pragma_table_info('sent') WHERE name = 'name_scheme'")?
+            .exists([])?;
+        if !has_scheme {
+            conn.execute_batch("ALTER TABLE sent ADD COLUMN name_scheme INTEGER NOT NULL DEFAULT 0")
+                .context("failed to update the index")?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -186,7 +206,7 @@ impl Index {
 
     pub fn sent_entries(&self, buddy: &str) -> Result<HashMap<String, SentEntry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT path, size, sha256, ciphertext_size FROM sent WHERE buddy = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT path, size, sha256, ciphertext_size, name_scheme FROM sent WHERE buddy = ?1")?;
         let rows = stmt.query_map(params![buddy], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -194,6 +214,7 @@ impl Index {
                     size: r.get::<_, i64>(1)? as u64,
                     sha256: r.get(2)?,
                     ciphertext_size: r.get::<_, i64>(3)? as u64,
+                    name_scheme: r.get::<_, i64>(4)? as u8,
                 },
             ))
         })?;
@@ -214,9 +235,9 @@ impl Index {
     pub fn record_sent(&self, buddy: &str, path: &str, e: &SentEntry) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.prepare_cached(
-            "INSERT OR REPLACE INTO sent (buddy, path, size, sha256, ciphertext_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO sent (buddy, path, size, sha256, ciphertext_size, name_scheme) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?
-        .execute(params![buddy, path, e.size as i64, e.sha256, e.ciphertext_size as i64])?;
+        .execute(params![buddy, path, e.size as i64, e.sha256, e.ciphertext_size as i64, e.name_scheme as i64])?;
         Ok(())
     }
 
@@ -322,6 +343,38 @@ impl Index {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Records that `path` is backed up on `buddy` under an encrypted name
+    /// now, so its plaintext-named copy (from before 0.14.0) can go:
+    /// replaces its `sent` row and queues the old copy for deletion in one
+    /// transaction, so a crash between the two can't orphan it.
+    pub fn record_name_hidden(&self, buddy: &str, path: &str, e: &SentEntry) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.prepare_cached(
+            "INSERT OR REPLACE INTO sent (buddy, path, size, sha256, ciphertext_size, name_scheme) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?
+        .execute(params![buddy, path, e.size as i64, e.sha256, e.ciphertext_size as i64, e.name_scheme as i64])?;
+        tx.prepare_cached("INSERT OR IGNORE INTO old_names (buddy, path) VALUES (?1, ?2)")?
+            .execute(params![buddy, path])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Plaintext-named copies still to delete on `buddy` (see
+    /// `record_name_hidden`).
+    pub fn old_names(&self, buddy: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT path FROM old_names WHERE buddy = ?1 ORDER BY path")?;
+        let rows = stmt.query_map(params![buddy], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    pub fn forget_old_name(&self, buddy: &str, path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("DELETE FROM old_names WHERE buddy = ?1 AND path = ?2")?.execute(params![buddy, path])?;
+        Ok(())
+    }
+
     pub fn forget_sent(&self, buddy: &str, paths: &[String]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -401,7 +454,7 @@ mod tests {
         idx.import_json_manifests(&dir).unwrap();
         assert!(dir.join("manifest-buddyA.json.migrated").exists());
         let sent = idx.sent_entries("buddyA").unwrap();
-        assert_eq!(sent["a.txt"], SentEntry { size: 5, sha256: "aa".into(), ciphertext_size: 200 });
+        assert_eq!(sent["a.txt"], SentEntry { size: 5, sha256: "aa".into(), ciphertext_size: 200, name_scheme: 0 }, "imported rows have plaintext names");
         assert_eq!(sent["old.txt"].ciphertext_size, 0, "missing field defaults like before");
         assert_eq!(idx.sent_summary("buddyA").unwrap(), (2, 200));
         assert!(idx.sent_entries("buddyB").unwrap().is_empty());
@@ -411,7 +464,8 @@ mod tests {
         assert_eq!(idx.sent_summary("buddyA").unwrap().0, 2);
 
         idx.forget_sent("buddyA", &["old.txt".to_string()]).unwrap();
-        idx.record_sent("buddyA", "b.txt", &SentEntry { size: 9, sha256: "cc".into(), ciphertext_size: 300 }).unwrap();
+        idx.record_sent("buddyA", "b.txt", &SentEntry { size: 9, sha256: "cc".into(), ciphertext_size: 300, name_scheme: 1 }).unwrap();
+        assert_eq!(idx.sent_entries("buddyA").unwrap()["b.txt"].name_scheme, 1);
         assert_eq!(idx.sent_summary("buddyA").unwrap(), (2, 500));
 
         // Hash cache only hits when size and mtime both still match.
@@ -422,6 +476,29 @@ mod tests {
         let keep = "b.txt".to_string();
         idx.prune_hashes(&[&keep].into_iter().collect()).unwrap();
         assert_eq!(idx.cached_hash("a.txt", 5, 111).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_from_before_0_14_gets_name_schemes() {
+        let dir = std::env::temp_dir().join(format!("bb-index-scheme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sent (buddy TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
+                     sha256 TEXT NOT NULL, ciphertext_size INTEGER NOT NULL, PRIMARY KEY (buddy, path));
+                 INSERT INTO sent VALUES ('buddyA', 'Photos/a.jpg', 5, 'aa', 200);",
+            )
+            .unwrap();
+        }
+        let idx = Index::open_at(&path).unwrap();
+        assert_eq!(idx.sent_entries("buddyA").unwrap()["Photos/a.jpg"].name_scheme, 0, "sent with its real name");
+        drop(idx);
+        // Opening again doesn't try to add the column twice.
+        Index::open_at(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

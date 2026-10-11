@@ -64,6 +64,130 @@ fn pattern(n: usize, seed: u8) -> Vec<u8> {
     (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
 }
 
+/// Every file and folder name the buddy keeps for us under `stored` is an
+/// encrypted one (or the buddy's own bookkeeping), in live files and in
+/// `.versions/` alike: no plaintext name from `plain` shows up anywhere.
+fn assert_names_hidden(stored: &Path, plain: &[&str]) {
+    let plain_parts: std::collections::HashSet<&str> =
+        plain.iter().flat_map(|p| p.split('/')).collect();
+    let mut seen = 0;
+    let walk = walkdir::WalkDir::new(stored).min_depth(1).into_iter().filter_entry(|e| e.file_name() != ".incoming");
+    for entry in walk {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_str().unwrap().to_string();
+        if [".versions", ".retention-v1", crate::names::PREFIX].contains(&name.as_str()) {
+            continue;
+        }
+        // A backup copy is "<remote name>.v<N>".
+        let name = match name.rsplit_once(".v") {
+            Some((base, slot)) if slot.parse::<u32>().is_ok() => base.to_string(),
+            _ => name,
+        };
+        assert!(!plain_parts.contains(name.as_str()), "plaintext name on the buddy: {}", entry.path().display());
+        assert!(
+            name.len() >= 52 && name.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'v')),
+            "not an encrypted name: {}",
+            entry.path().display()
+        );
+        seen += 1;
+    }
+    assert!(seen > 0, "nothing stored under {}", stored.display());
+}
+
+/// Step 7e of the e2e test: a buddy holding a 0.13-style backup (every
+/// file under its real path, plus a backup copy of one) gets moved to
+/// encrypted names by an ordinary cycle.
+async fn migrate_legacy_backup(
+    root: &Path,
+    ep_a: &Endpoint,
+    lookup_a: &MemoryLookup,
+    relay: &RelayUrl,
+    mine: &Path,
+    expected: &HashMap<String, Vec<u8>>,
+    pass: &SecretString,
+) {
+    let (config_e, files_e) = (root.join("e/config"), root.join("e/buddy-files"));
+    for d in [&config_e, &files_e] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let ep_e = endpoint(vec![protocol::ALPN.to_vec()], MemoryLookup::new()).await;
+    lookup_a.add_endpoint_info(ep_e.addr());
+    let e_id = ep_e.id();
+    let pledge: PledgeBook = Arc::new(Mutex::new(HashMap::from([(
+        ep_a.id().to_string(),
+        PledgeState { pledged_bytes: 1 << 40, received_bytes: 0 },
+    )])));
+    serve(ep_e.clone(), config_e, files_e.clone(), pledge);
+
+    // What 0.13 left behind: plaintext paths on the buddy, index rows with
+    // name scheme 0, and an older copy of hello.txt under .versions/.
+    let idx = crate::index::get();
+    let conn = ep_a.connect(iroh::EndpointAddr::new(e_id), protocol::ALPN).await.unwrap();
+    for (i, rel) in expected.keys().chain(std::iter::once(&"hello.txt".to_string())).enumerate() {
+        let abs = mine.join(rel);
+        let size = std::fs::metadata(&abs).unwrap().len();
+        let ciphertext_size = crate::backup::put_one_file(&conn, rel, &abs, size, None).await.unwrap();
+        if i < expected.len() {
+            let sha256 = crate::crypto::sha256_file(abs).await.unwrap();
+            let entry = crate::index::SentEntry { size, sha256, ciphertext_size, name_scheme: crate::names::SCHEME_PLAIN };
+            idx.record_sent(&e_id.to_string(), rel, &entry).unwrap();
+        }
+    }
+    drop(conn);
+    let stored = files_e.join(ep_a.id().to_string());
+    assert!(stored.join("hello.txt").exists() && stored.join(".versions/hello.txt.v1").exists());
+
+    let resends_before = idx.frequent_resends(7, 1, 0, 50).unwrap();
+
+    // One ordinary cycle moves everything.
+    // (BB_E2E_BIG_MB's big.img wasn't on the legacy buddy: it goes as new.)
+    let big = usize::from(mine.join("big.img").exists());
+    let stats = crate::backup::run_backup_cycle(ep_a, relay, mine, e_id, None).await.unwrap();
+    assert_eq!((stats.files_sent, stats.names_hidden, stats.files_failed), (expected.len() + big, expected.len(), 0), "{stats:?}");
+    assert_eq!(stats.files_deleted, 0, "old copies aren't reported as deleted files: {stats:?}");
+    assert!(idx.old_names(&e_id.to_string()).unwrap().is_empty(), "every old copy deleted");
+    assert_eq!(idx.frequent_resends(7, 1, 0, 50).unwrap(), resends_before, "hiding names isn't a re-send");
+
+    // Live files only under n1/ now. The old copies stay under .versions/
+    // with their real names until they expire (30 days), as documented.
+    let top: Vec<String> = std::fs::read_dir(&stored).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(top.iter().all(|n| [".incoming", ".versions", "n1"].contains(&n.as_str())), "{top:?}");
+    let tree: Vec<&str> = expected.keys().map(String::as_str).collect();
+    assert_names_hidden(&stored.join("n1"), &tree);
+
+    // Browse files lists each file once, by its real path, as live.
+    let listed = crate::restore::list_buddy_files(ep_a, relay, e_id).await.unwrap();
+    let mut paths: Vec<&str> = listed.iter().map(|f| f.path.as_str()).collect();
+    paths.sort();
+    let mut want = tree.clone();
+    if big == 1 {
+        want.push("big.img");
+    }
+    want.sort();
+    assert_eq!(paths, want);
+    assert!(listed.iter().all(|f| !f.deleted && crate::names::is_encrypted(&f.remote)));
+
+    // Reconciliation is clean; History still finds the old copies.
+    let rec = crate::backup::reconcile_with_buddy(ep_a, relay, e_id).await.unwrap();
+    assert!(rec.missing_on_buddy.is_empty() && rec.unexpected_on_buddy.is_empty(), "{rec:?}");
+    let versions = crate::restore::list_file_versions(ep_a, relay, e_id, "hello.txt").await.unwrap();
+    assert_eq!(versions.len(), 2, "the moved-off copy and the older one: {versions:?}");
+    let restored = root.join("e/restored");
+    crate::restore::restore_version(ep_a, relay, pass, e_id, &restored, "hello.txt", 1).await.unwrap();
+    assert_eq!(std::fs::read(restored.join("hello.txt.v1.bak")).unwrap(), expected["hello.txt"]);
+
+    // Everything restores, byte for byte.
+    let r = crate::restore::run_restore(ep_a, relay, pass, e_id, &restored).await.unwrap();
+    assert_eq!(r.files_restored, expected.len() + big);
+    for (rel, data) in expected {
+        assert_eq!(&std::fs::read(restored.join(rel)).unwrap(), data, "restored {rel}");
+    }
+
+    // Done: the next cycle has nothing to do.
+    let stats = crate::backup::run_backup_cycle(ep_a, relay, mine, e_id, None).await.unwrap();
+    assert!(stats.connection.is_none() && stats.files_sent == 0, "{stats:?}");
+}
+
 fn peak_rss_mb() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -161,6 +285,9 @@ async fn e2e_backup_restore_versions_and_compat() {
     assert_eq!(on_disk, sent_bytes, "index records exactly what the buddy stores");
     let staged_files = walkdir::WalkDir::new(stored.join(".incoming")).into_iter().flatten().filter(|e| e.file_type().is_file()).count();
     assert_eq!(staged_files, 0, "nothing left in upload staging");
+    // The buddy sees no file or folder names.
+    let tree: Vec<&str> = expected.keys().map(String::as_str).collect();
+    assert_names_hidden(&stored, &tree);
 
     // 1b. A big file whose upload is cut partway resumes where it stopped.
     // (Files over RESUMABLE_MIN_BYTES — 1 MiB in tests — go resumably;
@@ -232,6 +359,19 @@ async fn e2e_backup_restore_versions_and_compat() {
     let stats = crate::backup::run_backup_cycle(&ep_a, &relay, &mine, b_id, None).await.unwrap();
     assert_eq!(stats.files_sent, 0, "same content, new mtime: {stats:?}");
 
+    // 3b. A name too long to encrypt within filename limits is refused
+    // with a reason (once in Activity, every cycle in the failed list),
+    // never truncated.
+    let long_name = format!("long/{}.txt", "n".repeat(130));
+    write(&mine, &long_name, b"long name");
+    let stats = crate::backup::run_backup_cycle(&ep_a, &relay, &mine, b_id, None).await.unwrap();
+    assert_eq!((stats.files_sent, stats.files_failed), (0, 1), "{stats:?}");
+    assert!(stats.failed_paths[0].reason.unwrap().contains("too long"), "{stats:?}");
+    assert_eq!(stats.new_refusals.len(), 1, "{stats:?}");
+    let stats = crate::backup::run_backup_cycle(&ep_a, &relay, &mine, b_id, None).await.unwrap();
+    assert_eq!((stats.files_failed, stats.new_refusals.len()), (1, 0), "said once: {stats:?}");
+    std::fs::remove_dir_all(mine.join("long")).unwrap();
+
     // 4. A real edit and a delete.
     let v2 = b"hello again, version two".to_vec();
     write(&mine, "hello.txt", &v2);
@@ -280,7 +420,34 @@ async fn e2e_backup_restore_versions_and_compat() {
     assert!(!listed.iter().any(|f| f.path == "photos/2024/img 001.jpg"), "gone after delete permanently");
     let refused = crate::restore::purge_deleted(&ep_a, &relay, b_id, "hello.txt").await;
     assert!(refused.unwrap_err().to_string().contains("still exists"), "a live file is never purged");
-    assert!(stored.join("hello.txt").exists());
+    assert!(stored.join(crate::names::encrypt_path("hello.txt").unwrap()).exists());
+
+    // 7c. Still no names after overwrites, deletes and backup copies.
+    let mut tree: Vec<&str> = expected.keys().map(String::as_str).collect();
+    tree.push("photos/2024/img 001.jpg");
+    assert_names_hidden(&stored, &tree);
+    assert!(stored.join(".versions").exists(), "backup copies were checked too");
+
+    // 7d. Restore one folder (what the dashboard does: pick from the
+    // listing by real path).
+    let folder = root.join("a/restored-folder");
+    let chunk: Vec<_> = crate::restore::list_buddy_files(&ep_a, &relay, b_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|f| !f.deleted && f.path.starts_with("chunk/"))
+        .collect();
+    assert_eq!(chunk.len(), 2);
+    let r = crate::restore::restore_selected(&ep_a, &relay, &pass, b_id, &folder, &chunk, None).await.unwrap();
+    assert_eq!(r.files_restored, 2);
+    for rel in ["chunk/exact-64k.bin", "chunk/64k-plus-1.bin"] {
+        assert_eq!(std::fs::read(folder.join(rel)).unwrap(), expected[rel], "restored {rel}");
+    }
+
+    // 7e. A backup made before 0.14.0 (plaintext names on the buddy)
+    // moves to encrypted names: each file is re-sent under its new name,
+    // then its old copy is deleted. Needs nothing new from the buddy.
+    migrate_legacy_backup(&root, &ep_a, &lookup_a, &relay, &mine, &expected, &pass).await;
 
     // 8. A buddy that hasn't updated (v1 client) can still send to us.
     let lookup_c = MemoryLookup::new();
@@ -369,7 +536,8 @@ async fn e2e_backup_restore_versions_and_compat() {
     // What the old buddy stored decrypts with our key.
     let restored_old = root.join("restored-from-old");
     let (tx, done) = crate::crypto::decrypt_to_file(restored_old.join("x"));
-    tx.send(Ok(std::fs::read(old_store.join("deep/a/b/c/medium.bin")).unwrap())).await.unwrap();
+    let medium = crate::names::encrypt_path("deep/a/b/c/medium.bin").unwrap();
+    tx.send(Ok(std::fs::read(old_store.join(medium)).unwrap())).await.unwrap();
     drop(tx);
     done.await.unwrap().unwrap();
     assert_eq!(std::fs::read(restored_old.join("x")).unwrap(), expected["deep/a/b/c/medium.bin"]);
