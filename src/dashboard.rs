@@ -458,7 +458,7 @@ pub async fn run(
     Ok(())
 }
 
-fn resending_files() -> Vec<ResendStatus> {
+async fn resending_files(backup_dir: &std::path::Path) -> Vec<ResendStatus> {
     let stats = match crate::index::get().frequent_resends(RESEND_DAYS, RESEND_MIN_SENDS, RESEND_MIN_BYTES, 20) {
         Ok(stats) => stats,
         Err(err) => {
@@ -466,14 +466,23 @@ fn resending_files() -> Vec<ResendStatus> {
             return Vec::new();
         }
     };
-    // History stays for a week after a file is excluded; it's dealt with.
+    // History stays for a week after a file is excluded, deleted or moved;
+    // either way it's dealt with.
     let rules = crate::excludes::Rules::load().ok();
-    stats
-        .into_iter()
-        .filter(|s| !rules.as_ref().is_some_and(|r| r.is_excluded(&s.path)))
-        .take(5)
-        .map(|s| ResendStatus { path: s.path, sends: s.sends, buddies: s.buddies, bytes: s.bytes, size: s.size })
-        .collect()
+    let mut out = Vec::new();
+    for s in stats {
+        if rules.as_ref().is_some_and(|r| r.is_excluded(&s.path)) {
+            continue;
+        }
+        if !tokio::fs::try_exists(backup_dir.join(&s.path)).await.unwrap_or(true) {
+            continue;
+        }
+        out.push(ResendStatus { path: s.path, sends: s.sends, buddies: s.buddies, bytes: s.bytes, size: s.size });
+        if out.len() == 5 {
+            break;
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -641,7 +650,10 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         None => None,
     };
 
-    let resending = if state.backup_dir.is_some() { resending_files() } else { Vec::new() };
+    let resending = match &state.backup_dir {
+        Some(dir) => resending_files(dir).await,
+        None => Vec::new(),
+    };
 
     let label = state.self_label.lock().unwrap().clone();
     let latest_version = state.latest_version.lock().unwrap().clone();

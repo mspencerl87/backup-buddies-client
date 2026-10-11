@@ -145,7 +145,8 @@ in all", with an **Exclude** button. That adds a line for exactly that file
 near the top of `excludes.txt` (above your other patterns, so a `!` line
 can't bring it back); remove the line to undo it. Only re-sends of a file
 already on the buddy count, not first uploads, and the history is kept for
-30 days in the index.
+30 days in the index. Files that have since been excluded, deleted or moved
+drop off the list.
 
 **Excluding something that's already backed up removes it from your
 buddy**, the same way deleting it would: they keep the last copy for 30
