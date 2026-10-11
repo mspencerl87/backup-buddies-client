@@ -246,6 +246,12 @@ pub async fn read_own() -> Result<String> {
 /// the next backup cycle failing on it). Written to a temporary file and
 /// renamed, so a backup cycle never reads half of it.
 pub async fn save_own(own: &str) -> Result<()> {
+    write_own(own).await?;
+    crate::activity::record(crate::activity::kind::SETTINGS, None, "Exclude list saved on the dashboard", Vec::new());
+    Ok(())
+}
+
+async fn write_own(own: &str) -> Result<()> {
     let path = PATH.get().context("the exclude list isn't set up")?;
     let own = match own.find(BUILTIN_MARKER) {
         Some(at) => &own[..at],
@@ -259,6 +265,8 @@ pub async fn save_own(own: &str) -> Result<()> {
     tokio::fs::write(&tmp, &text).await.with_context(|| format!("can't write {}", tmp.display()))?;
     tokio::fs::rename(&tmp, path).await.with_context(|| format!("can't replace {}", path.display()))?;
     tracing::info!("exclude list changed from the dashboard");
+    // So the next Rules::load doesn't take this for a hand edit.
+    *LAST_LOADED.lock().unwrap() = Some(format!("{}\n{text}", defaults_enabled()));
     Ok(())
 }
 
@@ -309,7 +317,14 @@ pub async fn exclude_path(rel_path: &str) -> Result<()> {
     if !Rules::build(&updated, defaults_enabled())?.is_excluded(rel_path) {
         anyhow::bail!("couldn't write a pattern that matches {rel_path:?}");
     }
-    save_own(&updated).await
+    write_own(&updated).await?;
+    crate::activity::record(
+        crate::activity::kind::SETTINGS,
+        None,
+        format!("Excluded {rel_path} (it kept re-sending)"),
+        Vec::new(),
+    );
+    Ok(())
 }
 
 /// DEFAULT_EXCLUDES=off (or false/0/no) drops the built-in list.
@@ -356,6 +371,16 @@ impl Rules {
                 defaults = with_defaults,
                 "exclude list loaded"
             );
+            // Not the first load after a start: the file was edited by hand
+            // (dashboard saves update LAST_LOADED themselves).
+            if last.is_some() {
+                crate::activity::record(
+                    crate::activity::kind::SETTINGS,
+                    None,
+                    format!("{FILE_NAME} changed"),
+                    Vec::new(),
+                );
+            }
             *last = Some(key);
         }
         Ok(rules)

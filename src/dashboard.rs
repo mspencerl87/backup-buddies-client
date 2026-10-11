@@ -111,6 +111,12 @@ impl From<crate::backup::FailedFile> for FailedFileView {
 pub type CycleBook = Arc<Mutex<HashMap<String, CycleRecord>>>;
 
 pub fn record_cycle(cycle_stats: &CycleBook, node_id: &str, mut record: CycleRecord) {
+    let path = record.connection.as_ref().and_then(|c| match c.path {
+        crate::netinfo::PathKind::Direct => Some("direct"),
+        crate::netinfo::PathKind::Relay => Some("via relay"),
+        crate::netinfo::PathKind::Unknown => None,
+    });
+    crate::activity::buddy_health(node_id, &record.label, record.ok, &record.detail, path);
     let mut book = cycle_stats.lock().unwrap();
     let previous = book.get(node_id);
     record.last_ok_at = if record.ok {
@@ -441,6 +447,8 @@ pub async fn run(
         .route("/api/buddies/:node_id/purge", post(purge_handler))
         .route("/api/excludes", get(excludes_get_handler).post(excludes_save_handler))
         .route("/api/excludes/add", post(exclude_one_handler))
+        .route("/api/activity", get(activity_handler))
+        .route("/api/logs", get(logs_handler))
         .with_state(state)
         .merge(
             Router::new()
@@ -483,6 +491,31 @@ async fn resending_files(backup_dir: &std::path::Path) -> Vec<ResendStatus> {
         }
     }
     out
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    // all (default) | backups | problems | security — the card's chips.
+    filter: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn activity_handler(Query(q): Query<ActivityQuery>) -> Result<Json<Vec<crate::index::ActivityEvent>>, (StatusCode, String)> {
+    use crate::activity::kind;
+    let kinds: &[&str] = match q.filter.as_deref() {
+        Some("backups") => &[kind::BACKUP, kind::INCOMING, kind::RESTORE],
+        Some("problems") => &[kind::PROBLEM],
+        Some("security") => &[kind::SECURITY, kind::SETTINGS],
+        _ => &[],
+    };
+    crate::index::get()
+        .recent_activity(kinds, q.limit.unwrap_or(50).min(200))
+        .map(Json)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))
+}
+
+async fn logs_handler() -> Json<Vec<String>> {
+    Json(crate::activity::raw_log())
 }
 
 #[derive(Deserialize)]
@@ -775,6 +808,12 @@ async fn purge_handler(
     match crate::restore::purge_deleted(&state.endpoint, &state.relay_url, buddy_id, &body.path).await {
         Ok(()) => {
             tracing::info!(buddy = %node_id_str, path = %body.path, "deleted a file's backup copies permanently");
+            crate::activity::record(
+                crate::activity::kind::SETTINGS,
+                Some(&crate::activity::label(&node_id_str)),
+                format!("Deleted the kept copies of {} permanently", body.path),
+                Vec::new(),
+            );
             Json(serde_json::json!({ "ok": true })).into_response()
         }
         Err(err) => {
@@ -820,6 +859,12 @@ async fn restore_version_handler(
     .await
     {
         Ok(stats) => {
+            crate::activity::record(
+                crate::activity::kind::RESTORE,
+                Some(&crate::activity::label(&node_id_str)),
+                format!("Restored an older copy (version {}) of {}", body.version, body.path),
+                Vec::new(),
+            );
             tracing::info!(
                 buddy = %node_id_str,
                 files = stats.files_restored,
@@ -933,6 +978,18 @@ async fn restore_handler(
             if let Some(traffic) = stats.traffic {
                 crate::bandwidth::record_split(&state.data_dir, &state.bandwidth_book, traffic).await;
             }
+            crate::activity::record(
+                crate::activity::kind::RESTORE,
+                Some(&crate::activity::label(&node_id_str)),
+                format!(
+                    "Restored {} ({}) to {}/{}",
+                    crate::activity::plural(stats.files_restored, "file"),
+                    crate::activity::fmt_bytes(stats.bytes_restored),
+                    state.restore_dir_display,
+                    node_id_str
+                ),
+                if requested.is_empty() { Vec::new() } else { requested.clone() },
+            );
             Json(RestoreResponse {
                 restored_files: stats.files_restored,
                 dir: format!("{}/{}", state.restore_dir_display, node_id_str),
@@ -944,6 +1001,12 @@ async fn restore_handler(
         }
         Err(err) => {
             tracing::warn!(buddy = %node_id_str, error = %err, "restore from the dashboard failed");
+            crate::activity::record(
+                crate::activity::kind::PROBLEM,
+                Some(&crate::activity::label(&node_id_str)),
+                format!("Restore failed: {err}"),
+                Vec::new(),
+            );
             (StatusCode::BAD_GATEWAY, format!("restore failed: {err}")).into_response()
         }
     }
@@ -1142,6 +1205,39 @@ const INDEX_HTML: &str = r#"<!doctype html>
     border: 1px solid var(--border); background: #11141a; color: var(--text);
   }
   .password-form input:focus { outline: none; border-color: var(--accent); }
+  .activity-head { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+  .activity-head h2 { margin: 0; }
+  .chips { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+  button.chip {
+    background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+    padding: 0.2rem 0.65rem; font-size: 0.75rem; font-weight: 500; border-radius: 999px;
+  }
+  button.chip:hover:not(:disabled) { color: var(--text); border-color: var(--accent); box-shadow: none; }
+  button.chip.active { color: var(--text); border-color: var(--accent); background: rgba(79, 140, 255, 0.12); }
+  #activity-list { margin-top: 0.6rem; }
+  .act-row { display: flex; gap: 0.6rem; padding: 0.45rem 0; border-bottom: 1px solid var(--border); font-size: 0.83rem; }
+  .act-row:last-child { border-bottom: none; }
+  .act-row.has-details { cursor: pointer; }
+  .act-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 0.45rem; flex-shrink: 0; background: var(--text-muted); }
+  .act-dot.backup, .act-dot.restore, .act-dot.incoming { background: #2ec5ff; }
+  .act-dot.problem { background: var(--danger); }
+  .act-dot.buddy { background: var(--ok); }
+  .act-dot.security, .act-dot.settings { background: #f0b43c; }
+  .act-main { flex: 1; min-width: 0; }
+  .act-text { word-break: break-word; }
+  .act-buddy { font-weight: 600; margin-right: 0.35rem; }
+  .act-when { color: var(--text-muted); font-size: 0.75rem; white-space: nowrap; margin-top: 0.1rem; }
+  .act-more { color: var(--text-muted); font-size: 0.72rem; margin-left: 0.3rem; }
+  .act-details {
+    display: none; margin-top: 0.35rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem; color: var(--text-muted); white-space: pre-wrap; word-break: break-all;
+  }
+  .act-row.open .act-details { display: block; }
+  #raw-log {
+    margin: 0.6rem 0 0; max-height: 28rem; overflow: auto; padding: 0.6rem 0.7rem; border-radius: 8px;
+    background: #11141a; border: 1px solid var(--border); font-size: 0.7rem; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-all; color: var(--text-muted);
+  }
   .resend-row {
     display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
     padding: 0.55rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem;
@@ -1286,6 +1382,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <div class="device-grid-right">
   <div id="empty" class="card" style="display:none;">No buddies seen yet — waiting on the first poll of the API.</div>
   <div id="buddies"></div>
+  <div class="card" id="activity-card">
+    <div class="activity-head">
+      <h2>Activity</h2>
+      <div class="chips" id="activity-chips">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="backups">Backups</button>
+        <button class="chip" data-filter="problems">Problems</button>
+        <button class="chip" data-filter="security">Security</button>
+        <button class="chip" data-filter="raw">Raw log</button>
+      </div>
+    </div>
+    <div id="activity-list"></div>
+    <pre id="raw-log" style="display:none;"></pre>
+  </div>
 </div>
 </div>
 </main>
@@ -2362,6 +2472,7 @@ async function refresh() {
   document.getElementById("device-uptime").textContent = fmtUptime(data.uptime_secs);
   if (data.backup_dir && !excludesLoaded) loadExcludes();
   renderResending(data.resending || []);
+  loadActivity();
   document.getElementById("device-mdns-peers").textContent =
     data.mdns_peers_visible + (data.mdns_peers_visible === 1 ? " peer" : " peers");
   document.getElementById("device-cycle-interval").textContent = data.cycle_interval_secs + "s";
@@ -2546,6 +2657,87 @@ document.getElementById("resending-list").addEventListener("click", async (event
     result.style.color = "var(--danger)";
     result.textContent = "Not excluded: " + err.message;
   }
+});
+
+// --- Activity -----------------------------------------------------------
+// Events newest first (see activity.rs for what gets recorded). Refreshed
+// with every status poll, but only re-rendered when something changed, so
+// an expanded row stays open.
+let activityFilter = "all";
+let activityKey = "";
+
+function fmtWhen(unixSecs) {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
+  if (secs < 60) return "just now";
+  if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+  if (secs < 86400) return Math.floor(secs / 3600) + "h ago";
+  return Math.floor(secs / 86400) + "d ago";
+}
+
+async function loadActivity() {
+  const list = document.getElementById("activity-list");
+  const raw = document.getElementById("raw-log");
+  try {
+    if (activityFilter === "raw") {
+      const res = await fetch("/api/logs");
+      if (!res.ok) return;
+      const lines = await res.json();
+      const atBottom = raw.scrollHeight - raw.scrollTop - raw.clientHeight < 30;
+      raw.textContent = lines.join("\n") || "Nothing logged yet.";
+      if (atBottom) raw.scrollTop = raw.scrollHeight;
+      return;
+    }
+    const res = await fetch("/api/activity?limit=50&filter=" + activityFilter);
+    if (!res.ok) return;
+    const events = await res.json();
+    const key = activityFilter + ":" + events.map((e) => e.id).join(",") + ":" + Math.floor(Date.now() / 60000);
+    if (key === activityKey) return;
+    activityKey = key;
+    const open = new Set([...list.querySelectorAll(".act-row.open")].map((r) => r.dataset.id));
+    if (!events.length) {
+      list.innerHTML = '<div class="muted" style="padding:0.4rem 0;">Nothing here yet.</div>';
+      return;
+    }
+    list.innerHTML = events.map((e) => {
+      const details = e.details && e.details.length;
+      return '<div class="act-row' + (details ? " has-details" : "") + (open.has(String(e.id)) ? " open" : "") +
+        '" data-id="' + e.id + '">' +
+        '<span class="act-dot ' + escapeHtml(e.kind) + '"></span>' +
+        '<div class="act-main"><div class="act-text">' +
+        (e.buddy ? '<span class="act-buddy">' + escapeHtml(e.buddy) + "</span>" : "") +
+        escapeHtml(e.text) +
+        (details ? '<span class="act-more">' + e.details.length + (e.details.length === 1 ? " file" : " files") + " ▾</span>" : "") +
+        "</div>" +
+        (details ? '<div class="act-details">' + e.details.map(escapeHtml).join("\n") + "</div>" : "") +
+        "</div>" +
+        '<div class="act-when" title="' + escapeHtml(new Date(e.at * 1000).toLocaleString()) + '">' + fmtWhen(e.at) + "</div>" +
+        "</div>";
+    }).join("");
+  } catch (err) {
+    // A missed poll just leaves the last list up.
+  }
+}
+
+document.getElementById("activity-list").addEventListener("click", (event) => {
+  const row = event.target.closest(".act-row.has-details");
+  if (row) row.classList.toggle("open");
+});
+
+document.getElementById("activity-chips").addEventListener("click", (event) => {
+  const chip = event.target.closest(".chip");
+  if (!chip) return;
+  activityFilter = chip.dataset.filter;
+  activityKey = "";
+  document.querySelectorAll('#activity-chips .chip').forEach((c) => c.classList.toggle("active", c === chip));
+  const raw = activityFilter === "raw";
+  document.getElementById("activity-list").style.display = raw ? "none" : "block";
+  document.getElementById("raw-log").style.display = raw ? "block" : "none";
+  loadActivity().then(() => {
+    if (raw) {
+      const el = document.getElementById("raw-log");
+      el.scrollTop = el.scrollHeight;
+    }
+  });
 });
 </script>
 </body>

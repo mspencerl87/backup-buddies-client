@@ -204,6 +204,25 @@ thing as the `restore` command below and writes to the same place
 (`RESTORE_DIR_HOST/<their node id>/`), showing you the result right there
 instead of needing a terminal.
 
+### Activity (0.13.0)
+
+Under the buddy cards, **Activity** lists the last 50 things that happened,
+newest first, in plain language: files sent to or removed from a buddy
+(click a line for the file list), a buddy becoming unreachable or failing
+and working again, files a buddy refused, what a buddy stored with you or
+restored from you, restores you ran, exclude-list changes, logins (and
+wrong passwords, with the address), password changes, startups and
+available updates. The chips filter it to Backups, Problems or Security.
+
+Routine checks that find nothing new, and pings, aren't listed (they run
+every 30 seconds and the buddy cards already show them). A buddy that stays
+broken is one line when it breaks and one when it recovers. Events are kept
+for 30 days (at most 1,000) in the index, so they survive a restart.
+
+**Raw log** shows the last 300 lines of the client's own log, the same as
+`docker compose logs`, for when the plain-language list isn't enough. Those
+are kept in memory only and start over when the client restarts.
+
 ### Logging in (0.11.0)
 
 The dashboard can restore your decrypted files and change what's backed up,
@@ -740,6 +759,8 @@ reached.
 | `POST /api/password` | Change the dashboard password: body `{"current", "new"}` (8+ characters). Logs out other sessions |
 | `GET /api/excludes` | Your exclude lines (`own`), the built-in list, whether it's on, and where the file is |
 | `POST /api/excludes` | Save your exclude lines: body `{"own": "..."}`. `400` with the reason if a line is invalid (nothing is saved) |
+| `GET /api/activity?filter=&limit=` | Activity events, newest first. `filter`: `all` (default), `backups`, `problems` or `security`; `limit` default 50, at most 200 |
+| `GET /api/logs` | The last 300 log lines (memory only) |
 | `POST /api/excludes/add` | Exclude exactly one file: body `{"path"}`, relative to the backup folder. Used by the re-sending list's Exclude button |
 | `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, big files that keep re-sending, and per-buddy pledges, usage, health and bandwidth |
 | `GET /api/buddies/<node_id>/files` | What that buddy holds for you right now |

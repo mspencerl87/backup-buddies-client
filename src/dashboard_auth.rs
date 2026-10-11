@@ -336,11 +336,18 @@ pub async fn login_submit(
     if !auth.check(form.username, form.password).await {
         auth.note_failure(ip);
         tracing::warn!(from = %ip, "dashboard login failed");
+        let text = if auth.locked_out(ip).is_some() {
+            format!("Wrong password from {ip}; locked out for {} s after {MAX_FAILURES} tries", LOCKOUT.as_secs())
+        } else {
+            format!("Wrong password from {ip}")
+        };
+        crate::activity::record(crate::activity::kind::SECURITY, None, text, Vec::new());
         // Slows down guessing even before the lockout.
         tokio::time::sleep(Duration::from_millis(500)).await;
         return (StatusCode::UNAUTHORIZED, Html(login_html(Some("Wrong user name or password.")))).into_response();
     }
     auth.inner.failures.lock().unwrap().remove(&ip);
+    crate::activity::record(crate::activity::kind::SECURITY, None, format!("Logged in from {ip}"), Vec::new());
     let token = auth.new_session();
     let cookie = auth.session_cookie(&token, SESSION_LIFETIME.as_secs());
     ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
@@ -396,6 +403,12 @@ pub async fn change_password(
     let keep = auth.session_from(&headers);
     auth.inner.sessions.lock().unwrap().retain(|token, _| Some(token) == keep.as_ref());
     tracing::info!(from = %ip, "dashboard password changed");
+    crate::activity::record(
+        crate::activity::kind::SECURITY,
+        None,
+        format!("Dashboard password changed from {ip}; other sessions logged out"),
+        Vec::new(),
+    );
     StatusCode::NO_CONTENT.into_response()
 }
 

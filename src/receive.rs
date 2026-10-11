@@ -294,7 +294,17 @@ pub async fn handle_incoming(
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
-            Err(_) => break, // peer closed the connection — normal end of a sync cycle
+            Err(_) => {
+                // Peer closed the connection — normal end of a sync cycle.
+                // Give stream tasks still writing their last file a moment
+                // to count it before the Activity summary goes out.
+                let remote_id = remote_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    crate::activity::flush_incoming(&remote_id);
+                });
+                break;
+            }
         };
         let data_dir = data_dir.clone();
         let buddy_files_dir = buddy_files_dir.clone();
@@ -573,6 +583,9 @@ async fn commit_upload(
         tokio::fs::create_dir_all(parent).await.context("failed to create directory for incoming file")?;
     }
     tokio::fs::rename(tmp, dest).await.context("failed to store incoming file")?;
+    if let Some(remote) = sender_dir.file_name().and_then(|n| n.to_str()) {
+        crate::activity::incoming_stored(remote, bytes_received);
+    }
 
     if let Err(err) = save_usage_ledger(data_dir, pledge_book).await {
         // Don't fail the exchange over a ledger write hiccup — worst
@@ -1071,6 +1084,7 @@ async fn handle_delete(
 
     protocol::write_frame(send, &SyncAck::ok()).await?;
     tracing::info!(from = %remote_id, path = %path, "deleted file for buddy");
+    crate::activity::incoming_deleted(remote_id);
     Ok(())
 }
 
@@ -1232,7 +1246,12 @@ async fn handle_get(
     };
 
     match send_file(send, &src).await? {
-        Some(sent) => crate::bandwidth::record(data_dir, bandwidth_book, quality, sent).await,
+        Some(sent) => {
+            crate::bandwidth::record(data_dir, bandwidth_book, quality, sent).await;
+            if let Some(remote) = sender_dir.file_name().and_then(|n| n.to_str()) {
+                crate::activity::incoming_fetched(remote, sent);
+            }
+        }
         None => protocol::write_frame(send, &SyncAck::err("not found")).await?,
     }
     Ok(())
@@ -1276,6 +1295,7 @@ async fn handle_purge_deleted(
         }
     }
     tracing::info!(from = %remote_id, path = %path, copies = removed, "permanently removed backup copies at buddy's request");
+    crate::activity::incoming_purged(remote_id);
     protocol::write_frame(send, &SyncAck::ok()).await?;
     Ok(())
 }

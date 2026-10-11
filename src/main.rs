@@ -3,6 +3,7 @@
 
 mod backup;
 mod bandwidth;
+mod activity;
 mod dashboard;
 mod dashboard_auth;
 mod manifest;
@@ -530,11 +531,18 @@ async fn main() -> Result<()> {
     // device's own address is resolved yet) — it's noise, not signal,
     // for anyone reading these logs. RUST_LOG, if set, overrides this
     // entirely rather than layering on top of it.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| tracing_subscriber::EnvFilter::new("info,swarm_discovery=warn"),
-        ))
-        .init();
+    // Same log to stdout as before, plus a colourless copy of the recent
+    // lines in memory for the dashboard's Raw log tab (activity.rs).
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+                |_| tracing_subscriber::EnvFilter::new("info,swarm_discovery=warn"),
+            ))
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(activity::RawLogWriter))
+            .init();
+    }
     let mut config = Config::from_env()?;
     config.validate().await?;
 
@@ -559,6 +567,12 @@ async fn main() -> Result<()> {
     // open the on-disk index (importing old JSON manifests on first run).
     crypto::init(&config.passphrase, &account_id).context("failed to derive encryption key from BACKUP_PASSPHRASE")?;
     index::open(&config.data_dir).context("failed to open the index in DATA_DIR")?;
+    activity::record(
+        activity::kind::CLIENT,
+        None,
+        format!("Started, version {}", env!("CARGO_PKG_VERSION")),
+        Vec::new(),
+    );
     receive::clear_incoming(&config.buddy_files_dir).await;
     backup::init_spool(&config.data_dir).await;
     excludes::init(&config.data_dir).await;
@@ -971,6 +985,7 @@ async fn main() -> Result<()> {
                             }
 
                             let label = buddy.label.clone().unwrap_or_else(|| buddy.account_id.clone());
+                            activity::set_label(node_id_str, &label);
 
                             if let Some(backup_dir) = &config.backup_dir {
                                 let result = backup::run_backup_cycle(
@@ -1153,6 +1168,9 @@ async fn main() -> Result<()> {
                                     ),
                                     Err(err) => tracing::warn!(buddy = %label, ?err, "backup cycle failed"),
                                 }
+                                if let Ok(stats) = &result {
+                                    record_backup_activity(&label, stats);
+                                }
                                 dashboard::record_cycle(&cycle_stats, node_id_str, record);
 
                                 // Periodic reconciliation — independent of
@@ -1271,6 +1289,57 @@ async fn main() -> Result<()> {
 
     endpoint.close().await;
     Ok(())
+}
+
+/// The Activity card's line for a backup cycle that did something: what
+/// was sent and removed, and files the buddy refused for the first time.
+fn record_backup_activity(label: &str, stats: &backup::BackupCycleStats) {
+    use activity::{fmt_bytes, kind, plural};
+    if stats.files_sent > 0 || stats.files_deleted > 0 {
+        let mut parts = Vec::new();
+        if stats.files_sent > 0 {
+            parts.push(format!("Sent {} ({})", plural(stats.files_sent, "file"), fmt_bytes(stats.bytes_sent)));
+        }
+        if stats.files_deleted > 0 {
+            let why = match stats.newly_excluded {
+                0 => "deleted here".to_string(),
+                n if n >= stats.files_deleted => "now excluded".to_string(),
+                n => format!("{n} now excluded"),
+            };
+            let removed = format!("removed {} ({why})", plural(stats.files_deleted, "file"));
+            parts.push(if parts.is_empty() { format!("R{}", &removed[1..]) } else { removed });
+        }
+        let mut text = parts.join(", ");
+        if let Some(c) = &stats.connection {
+            let path = match c.path {
+                netinfo::PathKind::Direct => "direct",
+                netinfo::PathKind::Relay => "via relay",
+                netinfo::PathKind::Unknown => "",
+            };
+            if !path.is_empty() {
+                text.push_str(&format!(" · {path}"));
+            }
+        }
+        text.push_str(&format!(" · {:.1} s", stats.duration_ms as f64 / 1000.0));
+        let details = stats
+            .sent_paths
+            .iter()
+            .map(|p| format!("sent  {p}"))
+            .chain(stats.deleted_paths.iter().map(|p| format!("removed  {p}")))
+            .collect();
+        activity::record(kind::BACKUP, Some(label), text, details);
+    }
+    // Grouped by reason: "refused 4 files: pledge full".
+    let mut by_reason: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for (path, reason) in &stats.new_refusals {
+        match by_reason.iter_mut().find(|(r, _)| r == reason) {
+            Some((_, paths)) => paths.push(path.clone()),
+            None => by_reason.push((reason, vec![path.clone()])),
+        }
+    }
+    for (reason, paths) in by_reason {
+        activity::record(kind::PROBLEM, Some(label), format!("Refused {}: {reason}", plural(paths.len(), "file")), paths);
+    }
 }
 
 async fn load_or_generate_secret_key(data_dir: &Path) -> Result<SecretKey> {

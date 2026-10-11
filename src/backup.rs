@@ -58,7 +58,18 @@ pub struct BackupCycleStats {
     // gave us one — not every failure if there are many, just enough to
     // point someone at the problem.
     pub failed_paths: Vec<FailedFile>,
+    // For the dashboard's Activity card: which files went out and which
+    // were removed (capped at ACTIVITY_PATHS each), how many of the
+    // removals were files now excluded rather than deleted, and files the
+    // buddy refused for the first time (a refusal that repeats every
+    // cycle is only news once).
+    pub sent_paths: Vec<String>,
+    pub deleted_paths: Vec<String>,
+    pub newly_excluded: usize,
+    pub new_refusals: Vec<(String, &'static str)>,
 }
+
+const ACTIVITY_PATHS: usize = 200;
 
 const MAX_FAILED_PATHS_SHOWN: usize = 10;
 
@@ -370,6 +381,8 @@ pub async fn run_backup_cycle(
     });
 
     let mut put_count = 0;
+    let mut sent_paths = Vec::new();
+    let mut new_refusals = Vec::new();
     for (rel_path, abs_path, size, sha256) in &to_put {
         tracker.start_file(rel_path, *size);
         if !streaming && *size > protocol::LEGACY_PUT_MAX_BYTES {
@@ -419,6 +432,9 @@ pub async fn run_backup_cycle(
         match result {
             Ok(ciphertext_size) => {
                 put_count += 1;
+                if sent_paths.len() < ACTIVITY_PATHS {
+                    sent_paths.push(rel_path.clone());
+                }
                 forget_refusal(&buddy_node_id, rel_path);
                 // Recorded per file as it lands (one row, not a rewrite of
                 // everything), so a cycle interrupted partway only re-sends
@@ -446,6 +462,7 @@ pub async fn run_backup_cycle(
                     // changes, so say it once rather than every 30s.
                     Some(reason) => {
                         if note_refusal(&buddy_node_id, rel_path, reason) {
+                            new_refusals.push((rel_path.clone(), reason));
                             tracing::warn!(path = %rel_path, reason, "buddy refused this file — will keep retrying quietly");
                         } else {
                             tracing::debug!(path = %rel_path, reason, "buddy refused this file again");
@@ -464,12 +481,16 @@ pub async fn run_backup_cycle(
     tracker.clear_file();
     tracker.update(|p| p.phase = "deleting");
     let mut delete_count = 0;
+    let mut deleted_paths = Vec::new();
     for rel_path in &to_delete {
         let result = delete_one_file(&conn, rel_path).await;
         tracker.update(|p| p.files_deleted += 1);
         match result {
             Ok(()) => {
                 delete_count += 1;
+                if deleted_paths.len() < ACTIVITY_PATHS {
+                    deleted_paths.push(rel_path.clone());
+                }
                 if let Err(err) = idx.forget_sent(&buddy_node_id, std::slice::from_ref(rel_path)) {
                     tracing::warn!(path = %rel_path, ?err, "told buddy about a deleted file but failed to record it — may retry next cycle");
                 }
@@ -497,6 +518,10 @@ pub async fn run_backup_cycle(
         traffic: Some(meter.finish(&conn)),
         files_failed,
         failed_paths,
+        sent_paths,
+        deleted_paths,
+        newly_excluded,
+        new_refusals,
     };
     Ok(stats)
 }

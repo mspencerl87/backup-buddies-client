@@ -89,7 +89,17 @@ pub fn is_older(running: &str, latest: &str) -> bool {
 pub async fn run(http: reqwest::Client, url: String, latest: LatestVersion) {
     loop {
         match fetch_latest(&http, &url).await {
-            Ok(version) => *latest.lock().unwrap() = Some(version),
+            Ok(version) => {
+                let previous = latest.lock().unwrap().replace(version.clone());
+                if previous.as_deref() != Some(version.as_str()) && is_older(env!("CARGO_PKG_VERSION"), &version) {
+                    crate::activity::record(
+                        crate::activity::kind::CLIENT,
+                        None,
+                        format!("Update available: {version} (this is {})", env!("CARGO_PKG_VERSION")),
+                        Vec::new(),
+                    );
+                }
+            }
             Err(err) => tracing::debug!(?err, %url, "update check failed; will retry"),
         }
         tokio::time::sleep(CHECK_INTERVAL).await;
