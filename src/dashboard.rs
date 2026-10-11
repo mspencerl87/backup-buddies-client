@@ -197,9 +197,6 @@ struct AppState {
     // all practical purposes, since the dashboard comes up alongside the
     // rest of main.rs. Used only to report uptime; never reset.
     started_at: Instant,
-    // Whether DASHBOARD_PASSWORD is set (see dashboard_auth.rs) — the page
-    // shows a Log out button only then.
-    login_enabled: bool,
 }
 
 /// One entry per buddy we've ever kicked off a restore for — only the
@@ -290,7 +287,6 @@ struct StatusResponse {
     // which install.sh --update does.
     update_command: &'static str,
     uptime_secs: u64,
-    login_enabled: bool,
     // How many buddies are visible on the local network via mDNS right
     // now, and the fixed interval (seconds) the outbound loop polls/backs
     // up on — both Syncthing-style discovery/rescan signals, surfaced
@@ -384,9 +380,8 @@ pub async fn run(
     relay_url: RelayUrl,
     passphrase: SecretString,
     stale_after_secs: u64,
-    login: Option<dashboard_auth::Login>,
 ) -> anyhow::Result<()> {
-    let auth = Auth::new(login, bind_addr);
+    let auth = Auth::new(&data_dir, bind_addr);
     let state = AppState {
         node_id,
         data_dir,
@@ -409,7 +404,6 @@ pub async fn run(
         stale_after_secs,
         restore_progress: Arc::new(Mutex::new(HashMap::new())),
         started_at: Instant::now(),
-        login_enabled: auth.login_enabled(),
     };
 
     let app = Router::new()
@@ -430,21 +424,14 @@ pub async fn run(
             Router::new()
                 .route("/login", get(dashboard_auth::login_page).post(dashboard_auth::login_submit))
                 .route("/logout", post(dashboard_auth::logout))
+                .route("/api/password", post(dashboard_auth::change_password))
                 .with_state(auth.clone()),
         )
         .layer(axum::middleware::from_fn_with_state(auth.clone(), dashboard_auth::require_login));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    if auth.login_enabled() {
-        tracing::info!(addr = %bind_addr, "dashboard listening (login required)");
-    } else {
-        tracing::info!(
-            addr = %bind_addr,
-            "dashboard listening, from this machine only — set DASHBOARD_PASSWORD in .env to open it from other devices"
-        );
-    }
-    // Connect info: the login rate limit and local-only mode both need the
-    // caller's address.
+    tracing::info!(addr = %bind_addr, "dashboard listening");
+    // Connect info: the login rate limit needs the caller's address.
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
@@ -627,7 +614,6 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             "curl -fsSL https://app.filegarden.net/client/install.sh | bash -s -- --update"
         },
         uptime_secs: state.started_at.elapsed().as_secs(),
-        login_enabled: state.login_enabled,
         mdns_peers_visible: state.mdns_peers.lock().unwrap().len(),
         cycle_interval_secs: state.cycle_interval_secs,
         local_backup,
@@ -1077,6 +1063,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     background: #11141a; color: var(--text); border: 1px solid var(--border); border-radius: 8px;
   }
   #excludes-text:focus { outline: none; border-color: var(--accent); }
+  .password-form label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-top: 0.75rem; }
+  .password-form input {
+    width: 100%; margin-top: 0.25rem; padding: 0.45rem 0.6rem; border-radius: 8px; font-size: 0.9rem;
+    border: 1px solid var(--border); background: #11141a; color: var(--text);
+  }
+  .password-form input:focus { outline: none; border-color: var(--accent); }
   .excludes-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.6rem; flex-wrap: wrap; }
   #excludes-builtin summary { cursor: pointer; font-size: 0.85rem; margin-top: 0.9rem; }
   .builtin-group { margin-top: 0.6rem; font-size: 0.8rem; }
@@ -1088,9 +1080,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="title-row">
     <img src="/mark.svg" alt="">
     <h1>Backup Buddies</h1>
-    <form method="post" action="/logout" id="logout-form" style="display:none; margin-left:auto;">
-      <button class="secondary" type="submit">Log out</button>
-    </form>
+    <div style="margin-left:auto; display:flex; gap:0.5rem;">
+      <button class="secondary" type="button" id="password-open">Change password</button>
+      <form method="post" action="/logout" style="margin:0;">
+        <button class="secondary" type="submit">Log out</button>
+      </form>
+    </div>
   </div>
   <div class="sub">This device: <span id="device-label">…</span> <code id="node-id" class="muted"></code> · backing up <code id="backup-dir">…</code></div>
 </header>
@@ -1225,6 +1220,28 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <button class="secondary" id="browse-restore-all">Restore all</button>
       <div class="restore-result" id="browse-result"></div>
     </div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="password-modal">
+  <div class="modal" style="max-width:420px;">
+    <div class="modal-header">
+      <h2>Change password</h2>
+      <button class="secondary" id="password-close">Close</button>
+    </div>
+    <form id="password-form" class="password-form">
+      <label>Current password<input type="password" id="password-current" autocomplete="current-password" required></label>
+      <label>New password<input type="password" id="password-new" autocomplete="new-password" minlength="8" required></label>
+      <label>New password again<input type="password" id="password-again" autocomplete="new-password" minlength="8" required></label>
+      <div class="muted" style="font-size:0.78rem; margin-top:0.6rem;">
+        At least 8 characters. From now on this replaces <code>DASHBOARD_PASSWORD</code> in <code>.env</code>.
+        Forgot it? Delete <code>dashboard-login</code> in the config folder and restart to use the <code>.env</code> one again.
+      </div>
+      <div class="modal-footer">
+        <button type="submit" id="password-save">Change password</button>
+        <div class="restore-result" id="password-result"></div>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -2253,7 +2270,6 @@ async function refresh() {
     updateBox.style.display = "none";
   }
   document.getElementById("device-uptime").textContent = fmtUptime(data.uptime_secs);
-  document.getElementById("logout-form").style.display = data.login_enabled ? "block" : "none";
   if (data.backup_dir && !excludesLoaded) loadExcludes();
   document.getElementById("device-mdns-peers").textContent =
     data.mdns_peers_visible + (data.mdns_peers_visible === 1 ? " peer" : " peers");
@@ -2349,6 +2365,50 @@ excludesSave.addEventListener("click", async () => {
     excludesSave.disabled = false;
     excludesStatus.textContent = "Not saved: " + err.message;
     excludesStatus.style.color = "var(--danger)";
+  }
+});
+
+// --- Change password --------------------------------------------------
+const passwordModal = document.getElementById("password-modal");
+const passwordResult = document.getElementById("password-result");
+function closePasswordModal() {
+  passwordModal.classList.remove("open");
+  document.getElementById("password-form").reset();
+  passwordResult.textContent = "";
+}
+document.getElementById("password-open").addEventListener("click", () => {
+  passwordModal.classList.add("open");
+  document.getElementById("password-current").focus();
+});
+document.getElementById("password-close").addEventListener("click", closePasswordModal);
+document.getElementById("password-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const current = document.getElementById("password-current").value;
+  const next = document.getElementById("password-new").value;
+  passwordResult.style.color = "var(--danger)";
+  if (next !== document.getElementById("password-again").value) {
+    passwordResult.textContent = "The new passwords don't match.";
+    return;
+  }
+  const save = document.getElementById("password-save");
+  save.disabled = true;
+  passwordResult.style.color = "";
+  passwordResult.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current: current, new: next }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    document.getElementById("password-form").reset();
+    passwordResult.style.color = "var(--ok)";
+    passwordResult.textContent = "Password changed. Other devices logged in here will need the new one.";
+  } catch (err) {
+    passwordResult.style.color = "var(--danger)";
+    passwordResult.textContent = err.message;
+  } finally {
+    save.disabled = false;
   }
 });
 </script>

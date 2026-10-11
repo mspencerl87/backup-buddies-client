@@ -82,9 +82,6 @@ struct Config {
     // address (e.g. to bind loopback-only) when DASHBOARD_PORT alone
     // isn't enough.
     dashboard_bind: String,
-    // DASHBOARD_USER / DASHBOARD_PASSWORD. None: the dashboard only answers
-    // this machine (see dashboard_auth.rs).
-    dashboard_login: Option<dashboard_auth::Login>,
     // How long since a buddy's last *successful* cycle before the
     // dashboard calls them stale rather than just "last synced a while
     // ago" — see dashboard.rs's stale computation. 30s between cycles
@@ -188,7 +185,6 @@ impl Config {
             restore_dir_display,
             backup_dir,
             dashboard_bind,
-            dashboard_login: dashboard_auth::Login::from_env(),
             stale_after_secs,
             scan_interval_secs,
             sync_port,
@@ -823,7 +819,6 @@ async fn main() -> Result<()> {
         let relay_url = config.relay_url.clone();
         let passphrase = config.passphrase.clone();
         let stale_after_secs = config.stale_after_secs;
-        let dashboard_login = config.dashboard_login.take();
         tokio::spawn(async move {
             if let Err(err) = dashboard::run(
                 &config_dashboard_bind,
@@ -846,7 +841,6 @@ async fn main() -> Result<()> {
                 relay_url,
                 passphrase,
                 stale_after_secs,
-                dashboard_login,
             )
             .await
             {

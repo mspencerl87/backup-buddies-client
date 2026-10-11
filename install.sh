@@ -158,6 +158,8 @@ Next steps:
      Then set the folders: BACKUP_DIR_HOST (your files) and
      BUDDY_FILES_DIR_HOST (a folder with room for what your buddy stores
      with you). See the FOLDERS section in .env for examples.
+     Set DASHBOARD_PASSWORD too: it's your first login to this device's
+     dashboard (user admin), which stays locked without one.
   2. cd backup-buddies-client && docker compose up -d
      (builds the image locally the first time — a few minutes)
   3. docker compose logs -f

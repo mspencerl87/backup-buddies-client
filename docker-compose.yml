@@ -30,9 +30,8 @@
 # A local status page — per-buddy pledge usage, what's been sent/received,
 # last backup cycle, and a one-click restore — is served at
 # http://<this machine's address>:8080 once the container is up (change
-# DASHBOARD_PORT in .env to use a different port). It opens from other
-# devices only once DASHBOARD_PASSWORD is set in .env; until then, only on
-# this machine.
+# DASHBOARD_PORT in .env to use a different port), behind a login: set
+# DASHBOARD_PASSWORD in .env for the first one.
 
 services:
   client:

@@ -196,32 +196,33 @@ instead of needing a terminal.
 ### Logging in (0.11.0)
 
 The dashboard can restore your decrypted files and change what's backed up,
-so it isn't left open:
+so every page asks for a login, from any device:
 
-- **With a password** — set `DASHBOARD_PASSWORD` in `.env` (and optionally
-  `DASHBOARD_USER`, default `admin`), then `docker compose up -d` — every
-  page asks you to log in. You stay logged in for 30 days, or until the
-  client restarts (sessions are kept in memory). Five wrong passwords in a
-  row from one address lock it out for a minute. To change the password,
-  edit `.env` and restart.
-- **Without a password** it only opens on the machine running the client
-  (`http://localhost:8080`). From anywhere else you get a page saying to set
-  `DASHBOARD_PASSWORD`. There's deliberately no default password: one that
-  works until someone changes it works for whoever on your network tries it
-  first.
+1. **First time:** put a password in `.env` and restart
+   (`docker compose up -d`):
+   ```
+   DASHBOARD_PASSWORD=choose-a-long-one
+   ```
+   Log in as `admin` (or set `DASHBOARD_USER` too).
+2. **Change it** whenever you like with **Change password** at the top of the
+   dashboard. The new one is stored, hashed, in the config folder
+   (`dashboard-login`) and replaces the `.env` password from then on.
+3. **Forgot it?** Delete `dashboard-login` from the config folder and
+   restart; the password in `.env` works again.
 
-If you run Docker Desktop with a `ports:` mapping instead of host
-networking, requests reach the client from Docker's own address rather
-than localhost, so set a password there. The login is plain HTTP like the
-rest of the dashboard: fine on your own network, but if this machine is
-reachable from somewhere you don't trust (the open internet, a guest
-network), reach it over an SSH tunnel or VPN, or put a reverse proxy with
-HTTPS in front of it.
+You stay logged in for 30 days, or until the client restarts. Five wrong
+passwords in a row from one address lock it out for a minute. Changing the
+password logs out every other browser. Without any password the dashboard
+stays locked and says to set one: there's deliberately no default password,
+since one that works until someone changes it works for whoever on your
+network tries it first.
 
-The dashboard also refuses changes posted from other websites (including
-other web apps on the same machine) and, without a password, requests for
-any host name other than `localhost`, so a web page you visit can't use
-your browser to reach it.
+The login is plain HTTP like the rest of the dashboard: fine on your own
+network, but if this machine is reachable from somewhere you don't trust
+(the open internet, a guest network), reach it over an SSH tunnel or VPN,
+or put a reverse proxy with HTTPS in front of it. The dashboard also
+refuses changes posted from other websites (including other web apps on the
+same machine), so a page you visit can't act on it through your browser.
 
 ## Restoring
 
@@ -695,7 +696,7 @@ explanations.
 | `PUID`, `PGID` | unset (runs as root) | Run as this user and group id (`id -u`, `id -g`), so files it creates are yours. `PGID` defaults to `PUID`. Needed for most NFS shares |
 | `DASHBOARD_PORT` | `8080` | Port for this device's status page |
 | `DASHBOARD_BIND` | `0.0.0.0:<DASHBOARD_PORT>` | Full address to listen on. `127.0.0.1:8080` doesn't listen on the network at all |
-| `DASHBOARD_PASSWORD` | unset (dashboard opens on this machine only) | Password for the dashboard login. Needed to open it from any other device. See "Logging in" |
+| `DASHBOARD_PASSWORD` | unset (dashboard locked) | Password for the first dashboard login. Once you change it on the dashboard, the stored one is used instead. See "Logging in" |
 | `DASHBOARD_USER` | `admin` | User name for the dashboard login |
 | `SYNC_PORT` | `11235` | UDP port for buddy connections. Forward it on your router for direct (non-relayed) connections |
 | `SCAN_INTERVAL_SECS` | `30` | How often to look for changes and sync, in seconds. At least 5 |
@@ -714,9 +715,8 @@ explanations.
 ### Status dashboard endpoints
 
 The page at `http://<machine>:8080` is backed by a small JSON API on the
-same port. Every route except the login page needs a login session (or,
-without `DASHBOARD_PASSWORD`, a request from this machine); see "Logging
-in" above. API calls without one get `401`, pages redirect to `/login`.
+same port. Every route except the login page needs a login session; see
+"Logging in" above. API calls without one get `401`, pages redirect to `/login`.
 `<node_id>` is a buddy's Iroh node id. Every `/api/buddies/...` call
 connects to that buddy live, and answers `502` if the buddy can't be
 reached.
@@ -726,6 +726,7 @@ reached.
 | `GET /` | The dashboard page |
 | `GET /login`, `POST /login` | Login page, and the form it posts (`username`, `password`). Sets the session cookie |
 | `POST /logout` | Ends the session |
+| `POST /api/password` | Change the dashboard password: body `{"current", "new"}` (8+ characters). Logs out other sessions |
 | `GET /api/excludes` | Your exclude lines (`own`), the built-in list, whether it's on, and where the file is |
 | `POST /api/excludes` | Save your exclude lines: body `{"own": "..."}`. `400` with the reason if a line is invalid (nothing is saved) |
 | `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, and per-buddy pledges, usage, health and bandwidth |
