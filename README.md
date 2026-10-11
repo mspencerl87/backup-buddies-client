@@ -11,7 +11,8 @@ bookkeeping; this is the piece that does the real work.
 API who your paired buddies' devices are, then — if this device has
 `BACKUP_DIR` set (which `docker-compose.yml` always does; it just points
 at an empty, read-only folder when you haven't set `BACKUP_DIR_HOST`) —
-scans that folder, encrypts anything new or changed with
+scans that folder (skipping anything on the exclude list, see "Excluding
+files"), encrypts anything new or changed with
 `BACKUP_PASSPHRASE`, and sends just the diff to each buddy's device.
 Deleted files are told apart too, so your buddy's copy mirrors yours
 rather than only ever growing. A receive-only device (no `BACKUP_DIR_HOST`
@@ -203,6 +204,12 @@ There's also a "Restore from this buddy" button, which does the same
 thing as the `restore` command below and writes to the same place
 (`RESTORE_DIR_HOST/<their node id>/`), showing you the result right there
 instead of needing a terminal.
+
+It also has: a file browser with older versions of each file, an
+**Activity** log of what happened (see below), the **Exclusions** editor
+and a list of big files that keep re-sending (see "Excluding files"), and
+the device's disk and bandwidth. It's behind a login set in `.env` (see
+"Logging in").
 
 ### Activity (0.13.0)
 
