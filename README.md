@@ -137,6 +137,16 @@ your lines, with the built-in list underneath, and checks a change before
 saving it, so a bad line is shown to you instead of stopping the next
 backup. Editing the file directly still works too.
 
+**Big files that keep re-sending (0.12.0).** Any change re-sends the whole
+file, to every buddy. When a file adds up to at least 1 GB of re-sends over
+3 or more changes in the past week, the dashboard lists it (up to 5, most
+bytes first), e.g. "20.0 GB, re-sent 8 times to 2 buddies this week, 160 GB
+in all", with an **Exclude** button. That adds a line for exactly that file
+near the top of `excludes.txt` (above your other patterns, so a `!` line
+can't bring it back); remove the line to undo it. Only re-sends of a file
+already on the buddy count, not first uploads, and the history is kept for
+30 days in the index.
+
 **Excluding something that's already backed up removes it from your
 buddy**, the same way deleting it would: they keep the last copy for 30
 days (see "File versions"), then it's gone. The log says how many files
@@ -729,7 +739,8 @@ reached.
 | `POST /api/password` | Change the dashboard password: body `{"current", "new"}` (8+ characters). Logs out other sessions |
 | `GET /api/excludes` | Your exclude lines (`own`), the built-in list, whether it's on, and where the file is |
 | `POST /api/excludes` | Save your exclude lines: body `{"own": "..."}`. `400` with the reason if a line is invalid (nothing is saved) |
-| `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, and per-buddy pledges, usage, health and bandwidth |
+| `POST /api/excludes/add` | Exclude exactly one file: body `{"path"}`, relative to the backup folder. Used by the re-sending list's Exclude button |
+| `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, big files that keep re-sending, and per-buddy pledges, usage, health and bandwidth |
 | `GET /api/buddies/<node_id>/files` | What that buddy holds for you right now |
 | `GET /api/buddies/<node_id>/disk` | That buddy's real disk space and total commitments |
 | `GET /api/buddies/<node_id>/versions?path=<path>` | Older saved copies of one file |

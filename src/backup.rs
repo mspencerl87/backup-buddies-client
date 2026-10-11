@@ -430,6 +430,13 @@ pub async fn run_backup_cycle(
                 ) {
                     tracing::warn!(path = %rel_path, ?err, "backed up file but failed to record it — may be re-sent next cycle");
                 }
+                // Already on this buddy, so this was a change re-sending the
+                // whole file — counted for the dashboard's re-send warning.
+                if sent.contains_key(rel_path)
+                    && let Err(err) = idx.record_resend(&buddy_node_id, rel_path, *size)
+                {
+                    tracing::debug!(path = %rel_path, ?err, "couldn't record a re-send");
+                }
             }
             Err(err) => {
                 let reason = reject_reason_from_err(&err);

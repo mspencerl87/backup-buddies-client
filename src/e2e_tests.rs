@@ -204,6 +204,11 @@ async fn e2e_backup_restore_versions_and_compat() {
         u64::MAX,
         "a changed file must not resume from the old copy"
     );
+    // It was already on the buddy, so that counted as a re-send (the
+    // dashboard's "keeps re-sending" list); first uploads don't.
+    let resends = crate::index::get().frequent_resends(7, 1, 0, 10).unwrap();
+    let paths: Vec<(&str, u64, u64)> = resends.iter().map(|r| (r.path.as_str(), r.sends, r.size)).collect();
+    assert_eq!(paths, vec![("video/clip.mov", 1, 4_500_000)]);
     assert_eq!(std::fs::read_dir(config_a.join("outgoing")).unwrap().count(), 0);
     let staged_files = walkdir::WalkDir::new(stored.join(".incoming")).into_iter().flatten().filter(|e| e.file_type().is_file()).count();
     assert_eq!(staged_files, 0, "the old partial was discarded");

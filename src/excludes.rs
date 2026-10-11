@@ -262,6 +262,56 @@ pub async fn save_own(own: &str) -> Result<()> {
     Ok(())
 }
 
+/// `rel_path` as a pattern that matches just that one file: tied to the top
+/// of BACKUP_DIR, with glob characters escaped.
+fn exact_pattern(rel_path: &str) -> String {
+    let mut out = String::from("/");
+    for c in rel_path.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `own` with an exclude for exactly `rel_path` added. It goes above the
+/// first pattern line (after the leading comments), so no `!` line can
+/// bring the file back: the first match wins.
+fn with_exact_exclude(own: &str, rel_path: &str) -> String {
+    let pattern = exact_pattern(rel_path);
+    let lines: Vec<&str> = own.lines().collect();
+    if lines.iter().any(|l| l.trim() == pattern) {
+        return own.to_string();
+    }
+    let at = lines
+        .iter()
+        .position(|l| {
+            let l = l.trim();
+            !(l.is_empty() || l == "#" || l.starts_with("//") || l.starts_with("# "))
+        })
+        .unwrap_or(lines.len());
+    let mut out: Vec<String> = lines[..at].iter().map(|l| l.to_string()).collect();
+    out.push("// Kept re-sending (excluded from the dashboard):".to_string());
+    out.push(pattern);
+    if at < lines.len() {
+        out.push(String::new());
+    }
+    out.extend(lines[at..].iter().map(|l| l.to_string()));
+    out.join("\n") + "\n"
+}
+
+/// Excludes exactly `rel_path` — the dashboard's one-click exclude for a
+/// file that keeps re-sending.
+pub async fn exclude_path(rel_path: &str) -> Result<()> {
+    let own = read_own().await?;
+    let updated = with_exact_exclude(&own, rel_path);
+    if !Rules::build(&updated, defaults_enabled())?.is_excluded(rel_path) {
+        anyhow::bail!("couldn't write a pattern that matches {rel_path:?}");
+    }
+    save_own(&updated).await
+}
+
 /// DEFAULT_EXCLUDES=off (or false/0/no) drops the built-in list.
 pub fn defaults_enabled() -> bool {
     !matches!(
@@ -542,6 +592,22 @@ mod tests {
         assert!(save_own("[oops").await.is_err());
         assert_eq!(std::fs::read_to_string(dir.join(FILE_NAME)).unwrap(), text, "a bad save changes nothing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_exclude_goes_above_the_first_pattern() {
+        let own = "// my list\n\n!(?i)*.qcow2\n*.iso\n";
+        let updated = with_exact_exclude(own, "vm/big disk [old].qcow2");
+        assert!(updated.starts_with("// my list\n\n// Kept re-sending"), "{updated}");
+        let r = Rules::build(&updated, true).unwrap();
+        assert!(r.is_excluded("vm/big disk [old].qcow2"), "beats the earlier `!` line");
+        assert!(!r.is_excluded("vm/other.qcow2"));
+        assert!(!r.is_excluded("other/vm/big disk [old].qcow2"), "only that one path");
+        assert_eq!(with_exact_exclude(&updated, "vm/big disk [old].qcow2"), updated, "added once");
+
+        // Only comments (a fresh file): it goes at the end.
+        let fresh = with_exact_exclude(TEMPLATE, "a.db");
+        assert!(fresh.ends_with("// Kept re-sending (excluded from the dashboard):\n/a.db\n"), "{fresh}");
     }
 
     #[test]

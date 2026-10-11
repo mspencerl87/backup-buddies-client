@@ -12,6 +12,10 @@
 //!   time changed. Shared by all buddies.
 //! - `sent`: per buddy, what we last sent them for each path (plaintext
 //!   size + hash, and the encrypted size they store) — the old manifest.
+//! - `resends`: one row each time a file already on a buddy was sent
+//!   again because it changed, kept for RESEND_HISTORY_DAYS — for the
+//!   dashboard's "keeps re-sending" warning (any change re-sends the whole
+//!   file, so a big file that changes daily adds up fast).
 //!
 //! Existing JSON manifests are imported on first start and renamed to
 //! `*.json.migrated`, so nothing is re-sent after upgrading.
@@ -22,6 +26,28 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+
+/// How long re-send history is kept. Longer than the dashboard's window,
+/// which only looks at the last week.
+const RESEND_HISTORY_DAYS: i64 = 30;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// One file's re-sends since some time, across all buddies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResendStat {
+    pub path: String,
+    pub sends: u64,
+    pub buddies: u64,
+    pub bytes: u64,
+    /// Its size on the latest re-send.
+    pub size: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentEntry {
@@ -77,7 +103,14 @@ impl Index {
                  sha256          TEXT NOT NULL,
                  ciphertext_size INTEGER NOT NULL,
                  PRIMARY KEY (buddy, path)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS resends (
+                 buddy TEXT NOT NULL,
+                 path  TEXT NOT NULL,
+                 at    INTEGER NOT NULL,
+                 bytes INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS resends_at ON resends (at);",
         )
         .context("failed to set up the index")?;
         Ok(Self { conn: Mutex::new(conn) })
@@ -158,6 +191,47 @@ impl Index {
         )?
         .execute(params![buddy, path, e.size as i64, e.sha256, e.ciphertext_size as i64])?;
         Ok(())
+    }
+
+    /// Notes that `path`, already on `buddy`, was sent again because it
+    /// changed. Also drops history past RESEND_HISTORY_DAYS.
+    pub fn record_resend(&self, buddy: &str, path: &str, bytes: u64) -> Result<()> {
+        self.record_resend_at(buddy, path, bytes, now_secs())
+    }
+
+    fn record_resend_at(&self, buddy: &str, path: &str, bytes: u64, at: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("INSERT INTO resends (buddy, path, at, bytes) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![buddy, path, at, bytes as i64])?;
+        conn.prepare_cached("DELETE FROM resends WHERE at < ?1")?
+            .execute(params![at - RESEND_HISTORY_DAYS * 86_400])?;
+        Ok(())
+    }
+
+    /// Files re-sent at least `min_sends` times and `min_bytes` in total
+    /// over the last `days`, most bytes first.
+    pub fn frequent_resends(&self, days: i64, min_sends: u64, min_bytes: u64, limit: usize) -> Result<Vec<ResendStat>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT path, COUNT(*), COUNT(DISTINCT buddy), SUM(bytes),
+                    (SELECT r2.bytes FROM resends r2 WHERE r2.path = r.path ORDER BY r2.at DESC, r2.rowid DESC LIMIT 1)
+             FROM resends r WHERE at >= ?1
+             GROUP BY path HAVING COUNT(*) >= ?2 AND SUM(bytes) >= ?3
+             ORDER BY SUM(bytes) DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![now_secs() - days * 86_400, min_sends as i64, min_bytes as i64, limit as i64],
+            |row| {
+                Ok(ResendStat {
+                    path: row.get(0)?,
+                    sends: row.get::<_, i64>(1)? as u64,
+                    buddies: row.get::<_, i64>(2)? as u64,
+                    bytes: row.get::<_, i64>(3)? as u64,
+                    size: row.get::<_, i64>(4)? as u64,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn forget_sent(&self, buddy: &str, paths: &[String]) -> Result<()> {
@@ -260,6 +334,40 @@ mod tests {
         let keep = "b.txt".to_string();
         idx.prune_hashes(&[&keep].into_iter().collect()).unwrap();
         assert_eq!(idx.cached_hash("a.txt", 5, 111).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frequent_resends_add_up_per_file() {
+        let dir = std::env::temp_dir().join(format!("bb-index-resends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = Index::open_at(&dir.join("index.sqlite")).unwrap();
+        let gb = 1u64 << 30;
+        let now = now_secs();
+        for day in 0..4 {
+            idx.record_resend_at("buddyA", "vm/disk.qcow2", 20 * gb, now - day * 86_400).unwrap();
+        }
+        idx.record_resend_at("buddyB", "vm/disk.qcow2", 21 * gb, now).unwrap();
+        // Too long ago for the week's window.
+        idx.record_resend_at("buddyA", "vm/disk.qcow2", 20 * gb, now - 10 * 86_400).unwrap();
+        // Changes often, but small.
+        for _ in 0..10 {
+            idx.record_resend_at("buddyA", "notes.txt", 2_000, now).unwrap();
+        }
+        // Big, but only once.
+        idx.record_resend_at("buddyA", "video.mkv", 8 * gb, now).unwrap();
+
+        let stats = idx.frequent_resends(7, 3, gb, 10).unwrap();
+        assert_eq!(
+            stats,
+            vec![ResendStat { path: "vm/disk.qcow2".into(), sends: 5, buddies: 2, bytes: 101 * gb, size: 21 * gb }]
+        );
+
+        // History past RESEND_HISTORY_DAYS is dropped on the next insert.
+        idx.record_resend_at("buddyA", "old.bin", 1, now - 40 * 86_400).unwrap();
+        idx.record_resend_at("buddyA", "new.bin", 1, now).unwrap();
+        assert!(idx.frequent_resends(60, 1, 0, 10).unwrap().iter().all(|s| s.path != "old.bin"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

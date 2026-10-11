@@ -260,6 +260,25 @@ struct LocalBackupStatus {
     excluded_count: usize,
 }
 
+/// A big file that keeps re-sending (see index::frequent_resends): every
+/// change sends the whole file again, to every buddy.
+#[derive(Serialize)]
+struct ResendStatus {
+    path: String,
+    sends: u64,
+    buddies: u64,
+    bytes: u64,
+    size: u64,
+}
+
+// What counts as "keeps re-sending" on the dashboard: at least this many
+// re-sends adding up to at least this much over the last RESEND_DAYS.
+// Roughly a 1 GB file changing every other day, or anything bigger more
+// often; small files that change a lot don't cost enough to mention.
+const RESEND_DAYS: i64 = 7;
+const RESEND_MIN_SENDS: u64 = 3;
+const RESEND_MIN_BYTES: u64 = 1 << 30;
+
 #[derive(Serialize)]
 struct StatusResponse {
     node_id: String,
@@ -294,6 +313,8 @@ struct StatusResponse {
     mdns_peers_visible: usize,
     cycle_interval_secs: u64,
     local_backup: Option<LocalBackupStatus>,
+    // Big files re-sent often this week, already excluded ones left out.
+    resending: Vec<ResendStatus>,
     disk: Option<DiskStatus>,
     // Sum of every buddy's pledged_bytes — the total we've promised to
     // store for others on this same disk. Compared against `disk` on the
@@ -419,6 +440,7 @@ pub async fn run(
         .route("/api/restore-version/:node_id", post(restore_version_handler))
         .route("/api/buddies/:node_id/purge", post(purge_handler))
         .route("/api/excludes", get(excludes_get_handler).post(excludes_save_handler))
+        .route("/api/excludes/add", post(exclude_one_handler))
         .with_state(state)
         .merge(
             Router::new()
@@ -434,6 +456,37 @@ pub async fn run(
     // Connect info: the login rate limit needs the caller's address.
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+fn resending_files() -> Vec<ResendStatus> {
+    let stats = match crate::index::get().frequent_resends(RESEND_DAYS, RESEND_MIN_SENDS, RESEND_MIN_BYTES, 20) {
+        Ok(stats) => stats,
+        Err(err) => {
+            tracing::warn!(?err, "can't read re-send history");
+            return Vec::new();
+        }
+    };
+    // History stays for a week after a file is excluded; it's dealt with.
+    let rules = crate::excludes::Rules::load().ok();
+    stats
+        .into_iter()
+        .filter(|s| !rules.as_ref().is_some_and(|r| r.is_excluded(&s.path)))
+        .take(5)
+        .map(|s| ResendStatus { path: s.path, sends: s.sends, buddies: s.buddies, bytes: s.bytes, size: s.size })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct ExcludeOne {
+    path: String,
+}
+
+async fn exclude_one_handler(Json(body): Json<ExcludeOne>) -> Result<StatusCode, (StatusCode, String)> {
+    if body.path.is_empty() || body.path.contains('\n') {
+        return Err((StatusCode::BAD_REQUEST, "Not a file path".to_string()));
+    }
+    crate::excludes::exclude_path(&body.path).await.map_err(|err| (StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
@@ -588,6 +641,8 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         None => None,
     };
 
+    let resending = if state.backup_dir.is_some() { resending_files() } else { Vec::new() };
+
     let label = state.self_label.lock().unwrap().clone();
     let latest_version = state.latest_version.lock().unwrap().clone();
     let update_available = latest_version
@@ -617,6 +672,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         mdns_peers_visible: state.mdns_peers.lock().unwrap().len(),
         cycle_interval_secs: state.cycle_interval_secs,
         local_backup,
+        resending,
         disk,
         pledged_out_total_bytes,
         buddies,
@@ -1069,6 +1125,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
     border: 1px solid var(--border); background: #11141a; color: var(--text);
   }
   .password-form input:focus { outline: none; border-color: var(--accent); }
+  .resend-row {
+    display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
+    padding: 0.55rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem;
+  }
+  .resend-row:last-child { border-bottom: none; }
+  .resend-row .path { word-break: break-all; }
+  .resend-row button { padding: 0.25rem 0.6rem; font-size: 0.75rem; flex-shrink: 0; }
   .excludes-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.6rem; flex-wrap: wrap; }
   #excludes-builtin summary { cursor: pointer; font-size: 0.85rem; margin-top: 0.9rem; }
   .builtin-group { margin-top: 0.6rem; font-size: 0.8rem; }
@@ -1170,6 +1233,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="bar-track"><div class="bar-fill" id="bw-bar" style="width:0%"></div></div>
     <div class="muted" style="margin-top:0.4rem; font-size:0.78rem;" id="bw-note"></div>
+  </div>
+  <div class="card" id="resending-card" style="display:none;">
+    <h2>Big files that keep re-sending</h2>
+    <div class="muted">
+      Any change sends the whole file again, to every buddy, so these add up (and count toward relay
+      bandwidth when a buddy isn't reached directly). If one doesn't need an off-site copy, exclude it. For a
+      VM disk or a database, back up an export of it instead.
+    </div>
+    <div id="resending-list"></div>
+    <div class="restore-result" id="resending-result"></div>
   </div>
   <div class="card" id="excludes-card" style="display:none;">
     <h2>Exclusions</h2>
@@ -2271,6 +2344,7 @@ async function refresh() {
   }
   document.getElementById("device-uptime").textContent = fmtUptime(data.uptime_secs);
   if (data.backup_dir && !excludesLoaded) loadExcludes();
+  renderResending(data.resending || []);
   document.getElementById("device-mdns-peers").textContent =
     data.mdns_peers_visible + (data.mdns_peers_visible === 1 ? " peer" : " peers");
   document.getElementById("device-cycle-interval").textContent = data.cycle_interval_secs + "s";
@@ -2409,6 +2483,51 @@ document.getElementById("password-form").addEventListener("submit", async (event
     passwordResult.textContent = err.message;
   } finally {
     save.disabled = false;
+  }
+});
+
+// --- Big files that keep re-sending ------------------------------------
+let resendingKey = "";
+function renderResending(items) {
+  const card = document.getElementById("resending-card");
+  card.style.display = items.length ? "block" : "none";
+  // Rebuilt only when the list changes, so a poll doesn't swallow a click.
+  const key = JSON.stringify(items);
+  if (key === resendingKey) return;
+  resendingKey = key;
+  document.getElementById("resending-list").innerHTML = items.map((f) => {
+    const times = f.sends + (f.sends === 1 ? " time" : " times");
+    const to = f.buddies > 1 ? " to " + f.buddies + " buddies" : "";
+    return '<div class="resend-row"><div><div class="path">' + escapeHtml(f.path) + '</div>' +
+      '<div class="muted">' + fmtBytes(f.size) + ", re-sent " + times + to + " this week, " +
+      fmtBytes(f.bytes) + " in all</div></div>" +
+      '<button class="secondary resend-exclude" data-path="' + escapeHtml(f.path) + '">Exclude</button></div>';
+  }).join("");
+}
+
+document.getElementById("resending-list").addEventListener("click", async (event) => {
+  const button = event.target.closest(".resend-exclude");
+  if (!button) return;
+  const path = button.dataset.path;
+  if (!confirm("Exclude " + path + "?\n\nIt stops being backed up and is removed from your buddies " +
+      "(they keep the last copy for 30 days). You can undo this in Exclusions.")) return;
+  const result = document.getElementById("resending-result");
+  button.disabled = true;
+  try {
+    const res = await fetch("/api/excludes/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: path }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    result.style.color = "";
+    result.textContent = "Excluded " + path + ". Applies on the next check.";
+    // Show the new line in the editor, unless something's being typed there.
+    if (excludesText.value === excludesSaved) loadExcludes();
+  } catch (err) {
+    button.disabled = false;
+    result.style.color = "var(--danger)";
+    result.textContent = "Not excluded: " + err.message;
   }
 });
 </script>
