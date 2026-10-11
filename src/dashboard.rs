@@ -999,14 +999,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
     background: var(--accent-grad); -webkit-background-clip: text; background-clip: text; color: transparent;
   }
   header .sub { color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem; }
-  main { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+  /* 1800px rather than 1200px: at 1200 a wide screen was mostly empty
+     margin and This Device's stats wrapped. Capped rather than full width
+     so a buddy card's left and right figures don't drift far apart on
+     very wide screens. */
+  main { max-width: 1800px; margin: 0 auto; padding: 1.5rem; }
   /* This Device / Disk / Bandwidth on the left, buddy cards on the right —
      a fixed two-column split (not a height-balanced masonry one) since
      which side a card belongs on is decided by what it is, not by what
-     fits where. Mirrors the web dashboard's own left/right grouping. */
+     fits where. Mirrors the web dashboard's own left/right grouping.
+     Even halves. */
   .device-grid { display: flex; gap: 1.25rem; align-items: flex-start; }
   .device-grid-left { flex: 1; min-width: 0; }
-  .device-grid-right { flex: 1.3; min-width: 0; }
+  .device-grid-right { flex: 1; min-width: 0; }
   @media (max-width: 860px) {
     .device-grid { flex-direction: column; }
   }
