@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
@@ -16,6 +17,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+
+use crate::dashboard_auth::{self, Auth};
 use iroh::{Endpoint, EndpointId, RelayUrl};
 use serde::{Deserialize, Serialize};
 
@@ -194,6 +197,9 @@ struct AppState {
     // all practical purposes, since the dashboard comes up alongside the
     // rest of main.rs. Used only to report uptime; never reset.
     started_at: Instant,
+    // Whether DASHBOARD_PASSWORD is set (see dashboard_auth.rs) — the page
+    // shows a Log out button only then.
+    login_enabled: bool,
 }
 
 /// One entry per buddy we've ever kicked off a restore for — only the
@@ -284,6 +290,7 @@ struct StatusResponse {
     // which install.sh --update does.
     update_command: &'static str,
     uptime_secs: u64,
+    login_enabled: bool,
     // How many buddies are visible on the local network via mDNS right
     // now, and the fixed interval (seconds) the outbound loop polls/backs
     // up on — both Syncthing-style discovery/rescan signals, surfaced
@@ -377,7 +384,9 @@ pub async fn run(
     relay_url: RelayUrl,
     passphrase: SecretString,
     stale_after_secs: u64,
+    login: Option<dashboard_auth::Login>,
 ) -> anyhow::Result<()> {
+    let auth = Auth::new(login, bind_addr);
     let state = AppState {
         node_id,
         data_dir,
@@ -400,6 +409,7 @@ pub async fn run(
         stale_after_secs,
         restore_progress: Arc::new(Mutex::new(HashMap::new())),
         started_at: Instant::now(),
+        login_enabled: auth.login_enabled(),
     };
 
     let app = Router::new()
@@ -414,12 +424,73 @@ pub async fn run(
         .route("/api/buddies/:node_id/restore-progress", get(restore_progress_handler))
         .route("/api/restore-version/:node_id", post(restore_version_handler))
         .route("/api/buddies/:node_id/purge", post(purge_handler))
-        .with_state(state);
+        .route("/api/excludes", get(excludes_get_handler).post(excludes_save_handler))
+        .with_state(state)
+        .merge(
+            Router::new()
+                .route("/login", get(dashboard_auth::login_page).post(dashboard_auth::login_submit))
+                .route("/logout", post(dashboard_auth::logout))
+                .with_state(auth.clone()),
+        )
+        .layer(axum::middleware::from_fn_with_state(auth.clone(), dashboard_auth::require_login));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(addr = %bind_addr, "dashboard listening");
-    axum::serve(listener, app).await?;
+    if auth.login_enabled() {
+        tracing::info!(addr = %bind_addr, "dashboard listening (login required)");
+    } else {
+        tracing::info!(
+            addr = %bind_addr,
+            "dashboard listening, from this machine only — set DASHBOARD_PASSWORD in .env to open it from other devices"
+        );
+    }
+    // Connect info: the login rate limit and local-only mode both need the
+    // caller's address.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ExcludeGroup {
+    why: &'static str,
+    patterns: &'static [&'static str],
+}
+
+#[derive(Serialize)]
+struct ExcludesResponse {
+    // The person's own lines (everything above the built-in list).
+    own: String,
+    builtin: Vec<ExcludeGroup>,
+    defaults_enabled: bool,
+    // Where the file is, as the person knows it on the host.
+    file: String,
+}
+
+async fn excludes_get_handler(State(state): State<AppState>) -> Result<Json<ExcludesResponse>, (StatusCode, String)> {
+    let own = crate::excludes::read_own()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    let dir = crate::host_dir(&state.data_dir, "DATA_DIR_HOST").unwrap_or_else(|| state.data_dir.display().to_string());
+    Ok(Json(ExcludesResponse {
+        own,
+        builtin: crate::excludes::DEFAULTS.iter().map(|(why, patterns)| ExcludeGroup { why, patterns }).collect(),
+        defaults_enabled: crate::excludes::defaults_enabled(),
+        file: format!("{}/{}", dir.trim_end_matches('/'), crate::excludes::FILE_NAME),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ExcludesSave {
+    own: String,
+}
+
+// A pattern that doesn't compile comes back as 400 with the line, and the
+// file is left as it was.
+async fn excludes_save_handler(Json(body): Json<ExcludesSave>) -> Result<StatusCode, (StatusCode, String)> {
+    if body.own.len() > 256 * 1024 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "That's too long for an exclude list.".to_string()));
+    }
+    crate::excludes::save_own(&body.own).await.map_err(|err| (StatusCode::BAD_REQUEST, format!("{err:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn index_handler() -> Html<&'static str> {
@@ -556,6 +627,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             "curl -fsSL https://app.filegarden.net/client/install.sh | bash -s -- --update"
         },
         uptime_secs: state.started_at.elapsed().as_secs(),
+        login_enabled: state.login_enabled,
         mdns_peers_visible: state.mdns_peers.lock().unwrap().len(),
         cycle_interval_secs: state.cycle_interval_secs,
         local_backup,
@@ -999,6 +1071,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .version-row button { padding: 0.2rem 0.55rem; font-size: 0.72rem; flex-shrink: 0; }
   .modal-status { font-size: 0.8rem; margin-top: 0.6rem; }
   .modal-footer { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+  #excludes-text {
+    width: 100%; min-height: 12rem; margin-top: 0.6rem; padding: 0.6rem 0.7rem; resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
+    background: #11141a; color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+  }
+  #excludes-text:focus { outline: none; border-color: var(--accent); }
+  .excludes-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.6rem; flex-wrap: wrap; }
+  #excludes-builtin summary { cursor: pointer; font-size: 0.85rem; margin-top: 0.9rem; }
+  .builtin-group { margin-top: 0.6rem; font-size: 0.8rem; }
+  .builtin-group code { display: inline-block; margin: 0.15rem 0.2rem 0 0; }
 </style>
 </head>
 <body>
@@ -1006,6 +1088,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="title-row">
     <img src="/mark.svg" alt="">
     <h1>Backup Buddies</h1>
+    <form method="post" action="/logout" id="logout-form" style="display:none; margin-left:auto;">
+      <button class="secondary" type="submit">Log out</button>
+    </form>
   </div>
   <div class="sub">This device: <span id="device-label">…</span> <code id="node-id" class="muted"></code> · backing up <code id="backup-dir">…</code></div>
 </header>
@@ -1091,6 +1176,27 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="bar-track"><div class="bar-fill" id="bw-bar" style="width:0%"></div></div>
     <div class="muted" style="margin-top:0.4rem; font-size:0.78rem;" id="bw-note"></div>
   </div>
+  <div class="card" id="excludes-card" style="display:none;">
+    <h2>Exclusions</h2>
+    <div class="muted">
+      Files and folders in your backup folder that are never backed up, one pattern per line (Syncthing
+      rules: <code>*.iso</code>, <code>/Downloads</code>, <code>node_modules</code>, <code>!(?i)*.pst</code> to
+      back something up anyway). The first matching line wins. Saved to <code id="excludes-file">excludes.txt</code>.
+    </div>
+    <textarea id="excludes-text" spellcheck="false" aria-label="Your exclude patterns"></textarea>
+    <div class="muted" style="font-size:0.78rem; margin-top:0.4rem;">
+      Excluding something that's already backed up removes it from your buddies, like deleting it: they keep
+      the last copy for 30 days.
+    </div>
+    <div class="excludes-actions">
+      <button id="excludes-save" disabled>Save</button>
+      <span class="muted" id="excludes-status"></span>
+    </div>
+    <details id="excludes-builtin">
+      <summary id="excludes-builtin-summary">Built-in list</summary>
+      <div id="excludes-builtin-list"></div>
+    </details>
+  </div>
 </div>
 <div class="device-grid-right">
   <div id="empty" class="card" style="display:none;">No buddies seen yet — waiting on the first poll of the API.</div>
@@ -1123,6 +1229,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
 </div>
 
 <script>
+// Every API call goes through fetch; once a session has expired (or the
+// client restarted, which logs everyone out) send the person to log in.
+const rawFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const res = await rawFetch(...args);
+  if (res.status === 401) window.location.href = "/login";
+  return res;
+};
+
 function fmtBytes(n) {
   if (n === 0) return "0 B";
   const u = ["B","KB","MB","GB","TB"];
@@ -2138,6 +2253,8 @@ async function refresh() {
     updateBox.style.display = "none";
   }
   document.getElementById("device-uptime").textContent = fmtUptime(data.uptime_secs);
+  document.getElementById("logout-form").style.display = data.login_enabled ? "block" : "none";
+  if (data.backup_dir && !excludesLoaded) loadExcludes();
   document.getElementById("device-mdns-peers").textContent =
     data.mdns_peers_visible + (data.mdns_peers_visible === 1 ? " peer" : " peers");
   document.getElementById("device-cycle-interval").textContent = data.cycle_interval_secs + "s";
@@ -2174,6 +2291,66 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 5000);
+
+// --- Exclusions editor --------------------------------------------------
+// Edits the person's own part of excludes.txt; the client re-reads the
+// file every cycle, so a save applies on the next check. Loaded once
+// (when the status shows a backup folder) so a poll never overwrites
+// something being typed.
+let excludesLoaded = false;
+let excludesSaved = "";
+const excludesText = document.getElementById("excludes-text");
+const excludesSave = document.getElementById("excludes-save");
+const excludesStatus = document.getElementById("excludes-status");
+
+async function loadExcludes() {
+  excludesLoaded = true;
+  try {
+    const res = await fetch("/api/excludes");
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    excludesSaved = data.own;
+    excludesText.value = data.own;
+    document.getElementById("excludes-file").textContent = data.file;
+    const total = data.builtin.reduce((n, g) => n + g.patterns.length, 0);
+    document.getElementById("excludes-builtin-summary").textContent = data.defaults_enabled
+      ? "Built-in list (" + total + " patterns, applied after yours)"
+      : "Built-in list (off: DEFAULT_EXCLUDES=off is set in .env)";
+    document.getElementById("excludes-builtin-list").innerHTML = data.builtin.map((g) =>
+      '<div class="builtin-group"><div class="muted">' + escapeHtml(g.why) + '</div>' +
+      g.patterns.map((p) => "<code>" + escapeHtml(p) + "</code>").join("") + "</div>"
+    ).join("");
+    document.getElementById("excludes-card").style.display = "block";
+  } catch (err) {
+    excludesLoaded = false;
+  }
+}
+
+excludesText.addEventListener("input", () => {
+  excludesSave.disabled = excludesText.value === excludesSaved;
+  excludesStatus.textContent = excludesSave.disabled ? "" : "Not saved yet";
+  excludesStatus.style.color = "";
+});
+
+excludesSave.addEventListener("click", async () => {
+  excludesSave.disabled = true;
+  excludesStatus.textContent = "Saving…";
+  excludesStatus.style.color = "";
+  try {
+    const res = await fetch("/api/excludes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ own: excludesText.value }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    excludesSaved = excludesText.value;
+    excludesStatus.textContent = "Saved. Applies on the next check.";
+  } catch (err) {
+    excludesSave.disabled = false;
+    excludesStatus.textContent = "Not saved: " + err.message;
+    excludesStatus.style.color = "var(--danger)";
+  }
+});
 </script>
 </body>
 </html>

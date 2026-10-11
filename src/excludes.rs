@@ -225,8 +225,45 @@ pub async fn init(data_dir: &Path) {
     let _ = PATH.set(path);
 }
 
+/// The person's own part of excludes.txt (everything above the built-in
+/// list), for the dashboard's editor.
+pub async fn read_own() -> Result<String> {
+    let path = PATH.get().context("the exclude list isn't set up")?;
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_string(),
+        Err(err) => return Err(err).with_context(|| format!("can't read {}", path.display())),
+    };
+    let own = match text.find(BUILTIN_MARKER) {
+        Some(at) => &text[..at],
+        None => &text,
+    };
+    Ok(own.trim_end().to_string() + "\n")
+}
+
+/// Replaces the person's own part of excludes.txt with `own`, after
+/// checking it compiles (so the dashboard can show the bad line instead of
+/// the next backup cycle failing on it). Written to a temporary file and
+/// renamed, so a backup cycle never reads half of it.
+pub async fn save_own(own: &str) -> Result<()> {
+    let path = PATH.get().context("the exclude list isn't set up")?;
+    let own = match own.find(BUILTIN_MARKER) {
+        Some(at) => &own[..at],
+        None => own,
+    };
+    // Browsers send textarea contents with CRLF line endings.
+    let own = own.replace("\r\n", "\n");
+    Rules::build(&own, defaults_enabled())?;
+    let text = with_builtin_list(Some(&own), defaults_enabled());
+    let tmp = path.with_extension("txt.saving");
+    tokio::fs::write(&tmp, &text).await.with_context(|| format!("can't write {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, path).await.with_context(|| format!("can't replace {}", path.display()))?;
+    tracing::info!("exclude list changed from the dashboard");
+    Ok(())
+}
+
 /// DEFAULT_EXCLUDES=off (or false/0/no) drops the built-in list.
-fn defaults_enabled() -> bool {
+pub fn defaults_enabled() -> bool {
     !matches!(
         std::env::var("DEFAULT_EXCLUDES").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Ok("off" | "false" | "0" | "no")
@@ -486,6 +523,25 @@ mod tests {
         assert!(r.is_excluded("a.iso"));
         assert!(!r.is_excluded("Mail/ARCHIVE.PST"));
         assert!(r.is_excluded("Mail/ARCHIVE.OST"));
+    }
+
+    // The only test that sets PATH (it's set once per process).
+    #[tokio::test]
+    async fn dashboard_edits_keep_the_builtin_section() {
+        let dir = std::env::temp_dir().join(format!("bb-test-excludes-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).await;
+        assert!(read_own().await.unwrap().starts_with("// Files and folders"));
+
+        save_own("*.iso\r\n!(?i)*.pst\r\n").await.unwrap();
+        let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        assert!(text.starts_with(&format!("*.iso\n!(?i)*.pst\n\n{BUILTIN_MARKER}\n")), "{text}");
+        assert_eq!(read_own().await.unwrap(), "*.iso\n!(?i)*.pst\n");
+
+        assert!(save_own("[oops").await.is_err());
+        assert_eq!(std::fs::read_to_string(dir.join(FILE_NAME)).unwrap(), text, "a bad save changes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

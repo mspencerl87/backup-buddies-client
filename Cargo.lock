@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "backup-buddies-client"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "age",
  "age-core",
@@ -287,6 +287,7 @@ dependencies = [
  "axum",
  "bech32",
  "fs4",
+ "getrandom 0.4.3",
  "globset",
  "hex",
  "iroh",
