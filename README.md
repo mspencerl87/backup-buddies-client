@@ -330,6 +330,29 @@ cargo build --release
 docker build -t backup-buddies-client .
 ```
 
+## Verifying the image
+
+The published image is built by GitHub Actions from the public repo,
+github.com/mspencerl87/backup-buddies, and each build comes with a
+provenance attestation: a statement, signed by GitHub for that workflow
+run, that an image with this exact digest was built by
+`.github/workflows/build-client.yml` from a given commit. Since 0.15.0 each
+release is also tagged with its version. With the GitHub CLI:
+
+```bash
+gh attestation verify oci://ghcr.io/mspencerl87/backup-buddies/client:0.15.0 --repo mspencerl87/backup-buddies
+```
+
+A pass means the image was built by that repo's CI (not uploaded from
+someone's machine), shows the commit it came from so you can read exactly
+that code, and confirms the image hasn't changed since. It doesn't review
+the code for you; it ties what you run to what's published. To check the
+image you're actually running, use its digest
+(`docker compose images`, or `docker inspect --format '{{index .RepoDigests 0}}' <image>`)
+in place of the tag. Images built before this was added have no
+attestation, including the very first 0.15.0 build; pulling again gets
+the attested one.
+
 ## Updating, and releasing a new version
 
 There are two ways people run the client, and one update command covers
@@ -370,8 +393,8 @@ update command for that install kind (the CI-built image sets
 `BB_INSTALL_KIND=image` and shows `docker compose pull && docker compose up -d`;
 a local build shows the `install.sh --update` command). If the check can't complete (offline), nothing is shown
 rather than a false "up to date". It deliberately doesn't use GitHub
-releases: the source repo is private, and an `install.sh` build has no
-`.git` to read a commit from, whereas every install knows its own version.
+releases: an `install.sh` build has no `.git` to read a commit from,
+whereas every install knows its own version.
 
 **So: bump `version` in `Cargo.toml` whenever you ship a client change users
 should get**, and update `Cargo.lock` in the same commit. Running
@@ -746,6 +769,7 @@ Run these from the folder with your `docker-compose.yml` and `.env`.
 | `docker compose logs -f` | Follow the log (Ctrl+C to stop) |
 | `docker compose down` | Stop |
 | `docker compose pull && docker compose up -d` | Update an image install by hand |
+| `gh attestation verify oci://ghcr.io/mspencerl87/backup-buddies/client:<version> --repo mspencerl87/backup-buddies` | Check an image was built by the public repo's CI, and from which commit (see "Verifying the image") |
 | `docker compose run --rm client restore <buddy node id> [dir]` | One-shot restore of everything that buddy holds for you, decrypted, then exits. `<buddy node id>` is required (Buddies card). `[dir]` is optional and is a path *inside the container*; the default is `/restored/<node id>`, which is `RESTORE_DIR_HOST/<node id>` on the host. Needs the same `BACKUP_PASSPHRASE` and a device token from the same account |
 | `cargo build --release` | Build from source (Rust 1.85+, edition 2024) |
 | `docker build -t backup-buddies-client .` | Build the image yourself |
