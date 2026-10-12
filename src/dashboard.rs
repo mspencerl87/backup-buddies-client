@@ -601,7 +601,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
     let mut buddy_ids: BTreeSet<String> = pledge_snapshot.keys().cloned().collect();
     buddy_ids.extend(cycle_snapshot.keys().cloned());
 
-    let pledged_out_total_bytes: u64 = pledge_snapshot.values().map(|p| p.pledged_bytes).sum();
+    let pledged_out_total_bytes: u64 = receive::pledged_out_total(&pledge_snapshot);
 
     // statvfs is a blocking syscall — cheap, but run it off the async
     // runtime's worker thread like any other blocking call. None (rather
@@ -627,7 +627,11 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
 
     let mut buddies = Vec::with_capacity(buddy_ids.len());
     for node_id in buddy_ids {
-        let pledge = pledge_snapshot.get(&node_id).copied().unwrap_or_default();
+        let pledge = pledge_snapshot.get(&node_id).cloned().unwrap_or_default();
+        // The whole account's usage, since that's what the pledge is
+        // checked against (receive.rs); same as this device's alone unless
+        // the buddy runs more than one.
+        let pledge_used = receive::account_received_bytes(&pledge_snapshot, &node_id);
         let cycle = cycle_snapshot.get(&node_id).cloned();
         let last_reconcile = reconcile_snapshot.get(&node_id).cloned();
 
@@ -657,7 +661,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             label: cycle.as_ref().map(|c| c.label.clone()),
             node_id,
             pledged_bytes: pledge.pledged_bytes,
-            received_bytes_counted: pledge.received_bytes,
+            received_bytes_counted: pledge_used,
             received_files,
             received_total_bytes,
             sent_files,

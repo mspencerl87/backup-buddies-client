@@ -247,11 +247,47 @@ pub async fn expire_versions(buddy_files_dir: &Path) -> (usize, u64) {
 
 // How much of a buddy's pledge we've used (received_bytes) against how
 // much they've actually pledged us (pledged_bytes). Keyed by the buddy's
-// Iroh node id (EndpointId's string form).
-#[derive(Clone, Copy, Default)]
+// Iroh node id (EndpointId's string form), but a pledge is between two
+// accounts, and one account can run several devices (one per container).
+// Counted per device alone, each of them got the whole pledge: three
+// containers on a 20 GB pairing could store 60 GB here. So account_id
+// (from the API poll) groups a buddy's devices, and the pledge check adds
+// up all of them. None until the first poll names the device's account.
+#[derive(Clone, Default)]
 pub struct PledgeState {
     pub pledged_bytes: u64,
     pub received_bytes: u64,
+    pub account_id: Option<String>,
+}
+
+/// What `node_id`'s other devices (same buddy account) have stored with
+/// us; 0 while its account isn't known yet.
+fn received_by_other_devices(book: &HashMap<String, PledgeState>, node_id: &str) -> u64 {
+    let Some(account) = book.get(node_id).and_then(|s| s.account_id.as_deref()) else { return 0 };
+    book.iter()
+        .filter(|(id, s)| id.as_str() != node_id && s.account_id.as_deref() == Some(account))
+        .map(|(_, s)| s.received_bytes)
+        .sum()
+}
+
+/// Everything counted against the pledge `node_id` falls under: its own
+/// files plus its account's other devices'.
+pub fn account_received_bytes(book: &HashMap<String, PledgeState>, node_id: &str) -> u64 {
+    let own = book.get(node_id).map(|s| s.received_bytes).unwrap_or(0);
+    own.saturating_add(received_by_other_devices(book, node_id))
+}
+
+/// The total we've promised to store for others: each buddy account's
+/// pledge once, not once per device it runs.
+pub fn pledged_out_total(book: &HashMap<String, PledgeState>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    book.iter()
+        .filter(|(id, s)| match &s.account_id {
+            Some(account) => seen.insert(account.as_str()),
+            None => seen.insert(id.as_str()),
+        })
+        .map(|(_, s)| s.pledged_bytes)
+        .sum()
 }
 
 // Shared between the accept loop (enforces the pledge on incoming data)
@@ -572,15 +608,17 @@ async fn admit_put(
     }
 
     let mut book = pledge_book.lock().unwrap();
+    let other_devices = received_by_other_devices(&book, remote_id);
     let state = book.entry(remote_id.to_string()).or_default();
     let projected = state.received_bytes.saturating_sub(previous_size).saturating_add(ciphertext_len);
-    if projected > state.pledged_bytes {
+    if other_devices.saturating_add(projected) > state.pledged_bytes {
         tracing::warn!(
             from = %remote_id,
             path = %path,
             attempted_bytes = ciphertext_len,
             pledged_bytes = state.pledged_bytes,
             received_bytes = state.received_bytes,
+            other_devices_bytes = other_devices,
             "rejected file — would exceed this buddy's pledge"
         );
         return Err(PutRejectReason::PledgeExceeded);
@@ -1151,8 +1189,7 @@ async fn handle_disk_stats(
     buddy_files_dir: &Path,
     pledge_book: &PledgeBook,
 ) -> Result<()> {
-    let pledged_out_total_bytes: u64 =
-        { pledge_book.lock().unwrap().values().map(|s| s.pledged_bytes).sum() };
+    let pledged_out_total_bytes: u64 = pledged_out_total(&pledge_book.lock().unwrap());
 
     // The disk a buddy's files actually land on (BUDDY_FILES_DIR), which may
     // be a different drive from DATA_DIR's config/state.
@@ -1554,5 +1591,42 @@ mod tests {
         assert_eq!(files.iter().filter(|f| f.path == "notes/wtf.txt").count(), 1);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // A pledge covers a buddy's whole account: three devices on a 1000-byte
+    // pairing share 1000 bytes between them, not 1000 each.
+    #[tokio::test]
+    async fn pledge_is_shared_across_a_buddys_devices() {
+        let root = std::env::temp_dir().join(format!("bb-pledge-test-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        std::fs::create_dir_all(&root).unwrap();
+        let state = |account: &str| PledgeState { pledged_bytes: 1000, received_bytes: 0, account_id: Some(account.into()) };
+        let book: PledgeBook = Arc::new(Mutex::new(HashMap::from([
+            ("dev1".to_string(), state("acct-a")),
+            ("dev2".to_string(), state("acct-a")),
+            ("dev3".to_string(), state("acct-a")),
+            ("other".to_string(), state("acct-b")),
+        ])));
+        let put = |dev: &'static str, path: &'static str, len: u64| {
+            let (root, book) = (root.clone(), book.clone());
+            async move { admit_put(&root.join(dev), dev, &book, &root, path, len, 0).await.map(|_| ()) }
+        };
+
+        assert!(put("dev1", "a", 600).await.is_ok());
+        assert!(put("dev2", "b", 400).await.is_ok(), "the rest of the pledge, from another device");
+        assert!(matches!(put("dev3", "c", 1).await, Err(PutRejectReason::PledgeExceeded)));
+        assert!(matches!(put("dev1", "d", 1).await, Err(PutRejectReason::PledgeExceeded)));
+        assert!(put("other", "e", 1000).await.is_ok(), "another account has its own pledge");
+
+        let snapshot = book.lock().unwrap().clone();
+        assert_eq!(account_received_bytes(&snapshot, "dev3"), 1000);
+        assert_eq!(account_received_bytes(&snapshot, "other"), 1000);
+        assert_eq!(pledged_out_total(&snapshot), 2000, "each account's pledge counted once");
+
+        // A device whose account isn't known yet (before the first poll)
+        // only counts its own files.
+        book.lock().unwrap().get_mut("dev3").unwrap().account_id = None;
+        assert!(put("dev3", "c", 1).await.is_ok());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

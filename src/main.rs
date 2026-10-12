@@ -957,6 +957,29 @@ async fn main() -> Result<()> {
                     }
                     Ok((false, buddies, label)) => {
                         *self_label.lock().unwrap() = label;
+                        // Refresh what each buddy has pledged us, every
+                        // cycle — a re-created pairing can change it, and
+                        // this is also how a brand-new buddy first gets
+                        // enforcement enabled for incoming data (see
+                        // receive.rs's "unknown buddy" handling). All of
+                        // them before any backup cycle starts: the pledge
+                        // check adds up every device on a buddy's account,
+                        // so a device whose account isn't known yet (right
+                        // after a restart) would go uncounted for the
+                        // whole of an earlier buddy's long cycle.
+                        {
+                            let mut book = pledge_book.lock().unwrap();
+                            for buddy in &buddies {
+                                let Some(node_id_str) = &buddy.iroh_node_id else { continue };
+                                let entry = book.entry(node_id_str.clone()).or_default();
+                                entry.pledged_bytes = buddy
+                                    .pledged_bytes
+                                    .as_deref()
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                entry.account_id = Some(buddy.account_id.clone());
+                            }
+                        }
                         for buddy in buddies {
                             let Some(node_id_str) = &buddy.iroh_node_id else {
                                 tracing::info!(
@@ -969,21 +992,6 @@ async fn main() -> Result<()> {
                                 tracing::warn!(node_id = %node_id_str, "buddy sent an unparseable node id");
                                 continue;
                             };
-
-                            // Refresh what this buddy has pledged us, every
-                            // cycle — a re-created pairing can change it,
-                            // and this is also how a brand-new buddy first
-                            // gets enforcement enabled for incoming data
-                            // (see receive.rs's "unknown buddy" handling).
-                            let pledged_bytes = buddy
-                                .pledged_bytes
-                                .as_deref()
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0);
-                            {
-                                let mut book = pledge_book.lock().unwrap();
-                                book.entry(node_id_str.clone()).or_default().pledged_bytes = pledged_bytes;
-                            }
 
                             let label = buddy.label.clone().unwrap_or_else(|| buddy.account_id.clone());
                             activity::set_label(node_id_str, &label);

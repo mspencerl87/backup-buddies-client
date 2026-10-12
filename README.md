@@ -442,10 +442,12 @@ Config (`DATA_DIR`):
   Replaces the old `manifest-<buddy>.json` files, which are imported on
   first start of 0.5.0 and renamed `*.json.migrated` (safe to delete).
 - `usage.json` — `{ "<buddy node id>": <bytes received from them> }`,
-  tracked per buddy and checked against their pledge
+  tracked per buddy device and checked against their pledge
   (`buddy_pairings.pledged_bytes`, fetched from the API every 30s) before
-  accepting any incoming file. Deleting it resets what's counted toward
-  each buddy's pledge back to zero — the underlying buddy files are
+  accepting any incoming file. The pledge is per account: since 0.15.1, a
+  buddy running several devices shares one pledge across all of them,
+  rather than each device getting the whole of it. Deleting it resets
+  what's counted toward each buddy's pledge back to zero — the underlying buddy files are
   untouched, so this can desync the two if used carelessly.
 - `bandwidth.json` — lifetime bytes moved via relay vs. direct (see
   "Relay bandwidth" below). Deleting it just resets the dashboard's

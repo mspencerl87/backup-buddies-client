@@ -115,7 +115,7 @@ async fn migrate_legacy_backup(
     let e_id = ep_e.id();
     let pledge: PledgeBook = Arc::new(Mutex::new(HashMap::from([(
         ep_a.id().to_string(),
-        PledgeState { pledged_bytes: 1 << 40, received_bytes: 0 },
+        PledgeState { pledged_bytes: 1 << 40, received_bytes: 0, account_id: None },
     )])));
     serve(ep_e.clone(), config_e, files_e.clone(), pledge);
 
@@ -224,7 +224,7 @@ async fn e2e_backup_restore_versions_and_compat() {
 
     let pledge: PledgeBook = Arc::new(Mutex::new(HashMap::from([(
         a_id.to_string(),
-        PledgeState { pledged_bytes: 1 << 40, received_bytes: 0 },
+        PledgeState { pledged_bytes: 1 << 40, received_bytes: 0, account_id: None },
     )])));
     serve(ep_b.clone(), config_b.clone(), buddy_files_b.clone(), pledge.clone());
 
@@ -469,7 +469,7 @@ async fn e2e_backup_restore_versions_and_compat() {
     let lookup_c = MemoryLookup::new();
     lookup_c.add_endpoint_info(ep_b.addr());
     let ep_c = endpoint(vec![protocol::ALPN.to_vec()], lookup_c).await;
-    pledge.lock().unwrap().insert(ep_c.id().to_string(), PledgeState { pledged_bytes: 1 << 30, received_bytes: 0 });
+    pledge.lock().unwrap().insert(ep_c.id().to_string(), PledgeState { pledged_bytes: 1 << 30, received_bytes: 0, account_id: None });
     let legacy = age::encrypt(&age::scrypt::Recipient::new(SecretString::from(PASS.to_string())), b"from an old client").unwrap();
     {
         use sha2::{Digest, Sha256};
