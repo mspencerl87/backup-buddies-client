@@ -2265,7 +2265,7 @@ function renderBuddy(b) {
     const sample = cycle.failed_files.map((f) => escapeHtml(f.path)).join(", ");
     const more = cycle.files_failed > cycle.failed_files.length ? ", …" : "";
     failedLine =
-      '<div class="muted" style="margin-top: 0.4rem;">' +
+      '<div class="muted" style="margin-top: 0.4rem; overflow-wrap: anywhere;">' +
       cycle.files_failed + " file(s) don't fit in what this buddy has room for. " +
       "They'll go as soon as there's space: ask your buddy for a bigger pledge, or remove files from your backup folder." +
       '<details style="margin-top: 0.2rem;"><summary>Which files</summary>' + sample + more + "</details></div>";
@@ -2275,7 +2275,7 @@ function renderBuddy(b) {
         ? ": " + cycle.failed_files.map((f) => escapeHtml(f.path) + (f.reason ? " (" + f.reason + ")" : "")).join(", ")
         : "";
     failedLine =
-      '<div class="muted" style="color: var(--danger); margin-top: 0.4rem;">⚠ ' +
+      '<div class="muted" style="color: var(--danger); margin-top: 0.4rem; overflow-wrap: anywhere;">⚠ ' +
       cycle.files_failed + " file(s) won't send/receive" + sample + "</div>";
   }
 
