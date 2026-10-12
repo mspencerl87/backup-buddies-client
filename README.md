@@ -680,6 +680,15 @@ can no longer be restored. Only files you've already deleted have the
 button, and the buddy refuses if the file still exists there, so it can't
 remove a current file. Both buddies need 0.9.0.
 
+**What your buddy sees (0.15.0).** **Browse files** has a **What your
+buddy sees** button that lists your files the way they sit on the buddy's
+disk: encrypted names and stored sizes. Click one to see its first 256
+bytes exactly as stored, an `age-encryption.org/v1` header and then
+ciphertext, so you can check for yourself that nothing on their side is
+readable. It reads the file with the same request a restore uses, so it
+works with buddies on any version. A name stored by a client before 0.14.0
+shows as readable until it's re-sent under an encrypted one.
+
 ## Buddy health — staleness and per-file failures
 
 The pill next to each buddy's name shows the *last* cycle's result, but a
@@ -813,9 +822,10 @@ reached.
 | `GET /api/logs` | The last 300 log lines (memory only) |
 | `POST /api/excludes/add` | Exclude exactly one file: body `{"path"}`, relative to the backup folder. Used by the re-sending list's Exclude button |
 | `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, big files that keep re-sending, and per-buddy pledges, usage, health and bandwidth |
-| `GET /api/buddies/<node_id>/files` | What that buddy holds for you right now |
+| `GET /api/buddies/<node_id>/files` | What that buddy holds for you right now: each file's real `path`, its stored (encrypted) name `remote`, size and whether it was deleted |
 | `GET /api/buddies/<node_id>/disk` | That buddy's real disk space and total commitments |
 | `GET /api/buddies/<node_id>/versions?path=<path>` | Older saved copies of one file |
+| `GET /api/buddies/<node_id>/peek?path=<remote>` | The first 256 bytes of one stored file exactly as that buddy holds it (still encrypted), as `{"path", "hex"}`. For "What your buddy sees" |
 | `POST /api/restore/<node_id>` | Restore to `RESTORE_DIR_HOST/<node_id>/`. Body `{"paths": [...]}`; empty or missing means everything |
 | `GET /api/buddies/<node_id>/restore-progress` | Progress of the latest restore from that buddy (`{"active": false}` if none) |
 | `POST /api/restore-version/<node_id>` | Restore one older copy. Body `{"path", "version"}`. It's written next to the normal restore with a suffix and never overwrites it |

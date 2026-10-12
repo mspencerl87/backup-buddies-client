@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "backup-buddies-client"
-version = "0.14.2"
+version = "0.15.0"
 dependencies = [
  "aes-siv",
  "age",

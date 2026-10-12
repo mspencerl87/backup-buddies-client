@@ -289,6 +289,22 @@ async fn e2e_backup_restore_versions_and_compat() {
     let tree: Vec<&str> = expected.keys().map(String::as_str).collect();
     assert_names_hidden(&stored, &tree);
 
+    // 1a. "What your buddy sees": a peek returns the start of the file
+    // exactly as stored (an age header, never the plaintext), and a file
+    // shorter than the peek comes back whole.
+    let listing = crate::restore::list_buddy_files(&ep_a, &relay, b_id).await.unwrap();
+    let medium = listing.iter().find(|f| f.path == "deep/a/b/c/medium.bin").unwrap();
+    let peeked = crate::restore::peek_buddy_file(&ep_a, &relay, b_id, &medium.remote, 256).await.unwrap();
+    let on_disk = std::fs::read(stored.join(&medium.remote)).unwrap();
+    assert_eq!(peeked[..], on_disk[..256], "peek returns the stored bytes");
+    assert!(peeked.starts_with(b"age-encryption.org/v1"), "stored file starts with an age header");
+    let plain = &expected["deep/a/b/c/medium.bin"];
+    assert!(!on_disk.windows(64).any(|w| w == &plain[..64]), "plaintext isn't in the stored file");
+    // (Even a 17-byte file is a few hundred bytes stored: age's header.)
+    let hello = listing.iter().find(|f| f.path == "hello.txt").unwrap();
+    let peeked = crate::restore::peek_buddy_file(&ep_a, &relay, b_id, &hello.remote, 4096).await.unwrap();
+    assert_eq!(peeked, std::fs::read(stored.join(&hello.remote)).unwrap(), "short file comes back whole");
+
     // 1b. A big file whose upload is cut partway resumes where it stopped.
     // (Files over RESUMABLE_MIN_BYTES — 1 MiB in tests — go resumably;
     // medium.bin above already went that way without a cut.)

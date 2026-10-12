@@ -441,6 +441,7 @@ pub async fn run(
         .route("/api/buddies/:node_id/files", get(files_handler))
         .route("/api/buddies/:node_id/disk", get(buddy_disk_handler))
         .route("/api/buddies/:node_id/versions", get(versions_handler))
+        .route("/api/buddies/:node_id/peek", get(peek_handler))
         .route("/api/restore/:node_id", post(restore_handler))
         .route("/api/buddies/:node_id/restore-progress", get(restore_progress_handler))
         .route("/api/restore-version/:node_id", post(restore_version_handler))
@@ -768,6 +769,32 @@ async fn buddy_disk_handler(
             format!("couldn't reach buddy for disk stats: {err}"),
         )
             .into_response(),
+    }
+}
+
+/// How much of a stored file "What your buddy sees" shows.
+const PEEK_BYTES: usize = 256;
+
+// The start of one stored file as the buddy holds it (ciphertext, never
+// decrypted), for "What your buddy sees". `path` is the stored (remote)
+// name from the file list, since that's what the buddy's disk knows it by.
+async fn peek_handler(
+    State(state): State<AppState>,
+    AxumPath(node_id_str): AxumPath<String>,
+    Query(query): Query<PathQuery>,
+) -> impl IntoResponse {
+    let buddy_id: EndpointId = match node_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "not a valid Iroh node id".to_string()).into_response(),
+    };
+
+    match crate::restore::peek_buddy_file(&state.endpoint, &state.relay_url, buddy_id, &query.path, PEEK_BYTES)
+        .await
+    {
+        Ok(bytes) => Json(serde_json::json!({ "path": query.path, "hex": hex::encode(&bytes) })).into_response(),
+        Err(err) => {
+            (StatusCode::BAD_GATEWAY, format!("couldn't read that file from your buddy: {err}")).into_response()
+        }
     }
 }
 
@@ -1192,6 +1219,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .version-row button { padding: 0.2rem 0.55rem; font-size: 0.72rem; flex-shrink: 0; }
   .modal-status { font-size: 0.8rem; margin-top: 0.6rem; }
   .modal-footer { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+  .buddy-view { display: none; }
+  .buddy-view-on .buddy-view { display: block; }
+  .buddy-view-on .modal-search, .buddy-view-on .browse-breadcrumb, .buddy-view-on .modal-actions,
+  .buddy-view-on #browse-list, .buddy-view-on .modal-footer { display: none; }
+  .buddy-view p { font-size: 0.82rem; color: var(--text-muted); margin: 0.4rem 0; }
+  .stored-list { max-height: 14rem; overflow: auto; margin-top: 0.6rem; border: 1px solid var(--border); border-radius: 8px; }
+  .stored-row {
+    display: flex; justify-content: space-between; gap: 0.75rem; padding: 0.35rem 0.6rem; cursor: pointer;
+    border-bottom: 1px solid var(--border); font-size: 0.78rem;
+  }
+  .stored-row:last-child { border-bottom: none; }
+  .stored-row:hover, .stored-row.active { background: rgba(79, 140, 255, 0.10); }
+  .stored-name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+  .stored-size { color: var(--text-muted); white-space: nowrap; }
+  #stored-bytes {
+    margin: 0.6rem 0 0; max-height: 14rem; overflow: auto; padding: 0.6rem 0.7rem; border-radius: 8px;
+    background: #11141a; border: 1px solid var(--border); font-size: 0.72rem; line-height: 1.45;
+    white-space: pre; color: var(--text-muted);
+  }
   #excludes-text {
     width: 100%; min-height: 12rem; margin-top: 0.6rem; padding: 0.6rem 0.7rem; resize: vertical;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.8rem;
@@ -1403,7 +1449,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <div class="modal">
     <div class="modal-header">
       <h2 id="browse-title">Files</h2>
-      <button class="secondary" id="browse-close">Close</button>
+      <div>
+        <button class="secondary" id="browse-buddy-view">What your buddy sees</button>
+        <button class="secondary" id="browse-close">Close</button>
+      </div>
+    </div>
+    <div class="buddy-view">
+      <p id="buddy-view-intro"></p>
+      <p>
+        They can see how many files you back up, each one's size, how folders nest and how many entries
+        each holds, and when things change. They can't see any file or folder name, or anything inside a file.
+        Click a file to see the first bytes of it exactly as it's stored on their disk.
+      </p>
+      <div class="stored-list" id="stored-list"></div>
+      <pre id="stored-bytes">Pick a file above.</pre>
     </div>
     <div class="modal-search">
       <input type="text" id="browse-search" placeholder="Search by path…">
@@ -1763,7 +1822,94 @@ const browseRestoreSelected = document.getElementById("browse-restore-selected")
 const browseRestoreAll = document.getElementById("browse-restore-all");
 const browseResult = document.getElementById("browse-result");
 
+// "What your buddy sees": the same file list, but by the names and sizes
+// it's stored under on the buddy's disk, plus the first bytes of one file
+// as they hold it. Lets people check for themselves that what sits on
+// someone else's machine is unreadable, instead of taking it on trust.
+const browseBuddyViewBtn = document.getElementById("browse-buddy-view");
+const buddyViewIntro = document.getElementById("buddy-view-intro");
+const storedList = document.getElementById("stored-list");
+const storedBytes = document.getElementById("stored-bytes");
+const STORED_ROWS_SHOWN = 500;
+
+function hexDump(hex) {
+  const bytes = hex.match(/../g) || [];
+  const lines = [];
+  for (let i = 0; i < bytes.length; i += 16) {
+    const chunk = bytes.slice(i, i + 16);
+    const ascii = chunk.map((b) => {
+      const c = parseInt(b, 16);
+      return c >= 32 && c < 127 ? String.fromCharCode(c) : ".";
+    }).join("");
+    lines.push(i.toString(16).padStart(4, "0") + "  " + chunk.join(" ").padEnd(47) + "  " + ascii);
+  }
+  return lines.join("\n");
+}
+
+async function peekStored(file, row) {
+  storedList.querySelectorAll(".stored-row.active").forEach((r) => r.classList.remove("active"));
+  if (row) row.classList.add("active");
+  storedBytes.textContent = "Reading the start of this file from your buddy…";
+  try {
+    const res = await fetch("/api/buddies/" + encodeURIComponent(browseState.nodeId) +
+      "/peek?path=" + encodeURIComponent(file.remote));
+    if (!res.ok) throw new Error((await res.text()) || ("HTTP " + res.status));
+    const body = await res.json();
+    const shown = body.hex.length / 2;
+    storedBytes.textContent =
+      "First " + shown + " bytes (of " + fmtBytes(file.size) + "), exactly as stored on their disk:\n" +
+      file.remote + "\n\n" + hexDump(body.hex);
+  } catch (err) {
+    storedBytes.textContent = "Couldn't read it: " + err.message;
+  }
+}
+
+function renderBuddyView() {
+  // Deleted files only survive as old copies, which a plain Get can't
+  // fetch, so the view sticks to live ones.
+  const live = browseState.files.filter((f) => !f.deleted)
+    .sort((a, b) => a.remote.localeCompare(b.remote));
+  const total = live.reduce((sum, f) => sum + f.size, 0);
+  buddyViewIntro.textContent = live.length
+    ? browseState.label + " holds " + live.length + " file" + (live.length === 1 ? "" : "s") +
+      " of yours, " + fmtBytes(total) + " in all. Here's the list as it sits on their disk."
+    : browseState.label + " isn't holding any files of yours yet.";
+  storedList.innerHTML = "";
+  for (const f of live.slice(0, STORED_ROWS_SHOWN)) {
+    const row = document.createElement("div");
+    row.className = "stored-row";
+    // Same stored and real name means it went over before names were
+    // encrypted (clients before 0.14.0): say so rather than hide it.
+    const plain = f.remote === f.path
+      ? ' <span class="stored-size">(name readable: stored by a client before 0.14.0)</span>'
+      : "";
+    row.innerHTML = '<span class="stored-name">' + escapeHtml(f.remote) + plain + "</span>" +
+      '<span class="stored-size">' + fmtBytes(f.size) + "</span>";
+    row.addEventListener("click", () => peekStored(f, row));
+    storedList.appendChild(row);
+  }
+  if (live.length > STORED_ROWS_SHOWN) {
+    const more = document.createElement("div");
+    more.className = "stored-row";
+    more.textContent = "…and " + (live.length - STORED_ROWS_SHOWN) + " more";
+    storedList.appendChild(more);
+  }
+  storedBytes.textContent = live.length ? "Pick a file above." : "";
+  if (live.length) peekStored(live[0], storedList.firstChild);
+}
+
+function setBuddyView(on) {
+  browseModal.classList.toggle("buddy-view-on", on);
+  browseBuddyViewBtn.textContent = on ? "Back to my files" : "What your buddy sees";
+  if (on) renderBuddyView();
+}
+
+browseBuddyViewBtn.addEventListener("click", () => {
+  setBuddyView(!browseModal.classList.contains("buddy-view-on"));
+});
+
 function closeBrowseModal() {
+  setBuddyView(false);
   browseModal.classList.remove("open");
   browseState.nodeId = null;
   browseState.files = [];
@@ -2122,6 +2268,7 @@ async function openBrowseModal(nodeId, label) {
   browseList.innerHTML = "";
   browseBreadcrumb.innerHTML = "";
   browseModal.classList.add("open");
+  browseBuddyViewBtn.disabled = true;
 
   try {
     const res = await fetch("/api/buddies/" + encodeURIComponent(nodeId) + "/files");
@@ -2130,6 +2277,7 @@ async function openBrowseModal(nodeId, label) {
     browseState.files = (body.files || []).slice().sort((a, b) => a.path.localeCompare(b.path));
     browseState.tree = buildFileTree(browseState.files);
     renderBrowseView();
+    browseBuddyViewBtn.disabled = false;
   } catch (err) {
     browseList.innerHTML = "";
     browseCount.textContent = "";

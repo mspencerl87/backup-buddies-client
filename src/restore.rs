@@ -59,14 +59,14 @@ pub struct RestoreStats {
 
 /// One file a buddy holds for us. `path` is its real path, read back from
 /// the name the buddy stores it under (`remote`, see names.rs), and is
-/// what the dashboard shows and sends back; `remote` stays on this side.
+/// what the dashboard shows and sends back for restores. `remote` goes to
+/// the (local) dashboard too, for "What your buddy sees" and its peek.
 #[derive(Debug, Clone, Serialize)]
 pub struct BuddyFile {
     pub path: String,
     pub size: u64,
     /// See `ListEntry::deleted`.
     pub deleted: bool,
-    #[serde(skip)]
     pub remote: String,
 }
 
@@ -426,6 +426,40 @@ async fn restore_paths_on(
             }
     }
     Ok((restored, bytes))
+}
+
+/// The first `max` bytes of one stored file exactly as the buddy holds it:
+/// ciphertext, never decrypted. For the dashboard's "What your buddy sees"
+/// view, so people can see for themselves that what sits on someone else's
+/// disk is unreadable, rather than taking it on trust. Uses the ordinary
+/// Get (so any buddy version answers it) and stops reading once it has
+/// enough; the buddy just sees the transfer cut short.
+pub async fn peek_buddy_file(
+    endpoint: &Endpoint,
+    relay_url: &RelayUrl,
+    buddy_id: EndpointId,
+    remote: &str,
+    max: usize,
+) -> Result<Vec<u8>> {
+    let conn = connect(endpoint, relay_url, buddy_id).await?;
+    let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
+    protocol::write_frame(&mut send, &SyncRequest::Get { path: remote.to_string() }).await?;
+    send.finish().context("failed to finish send stream")?;
+
+    let ack: SyncAck = protocol::read_frame(&mut recv).await.context("failed to read ack")?;
+    if !ack.ok {
+        anyhow::bail!("buddy could not serve file: {}", ack.error.unwrap_or_default());
+    }
+    let mut out = Vec::with_capacity(max);
+    let mut buf = vec![0u8; max];
+    while out.len() < max {
+        match recv.read(&mut buf[..max - out.len()]).await.context("connection ended mid-file")? {
+            Some(n) => out.extend_from_slice(&buf[..n]),
+            None => break,
+        }
+    }
+    recv.stop(iroh::endpoint::VarInt::from_u32(0)).ok();
+    Ok(out)
 }
 
 // Returns the ciphertext length read off the wire on success — see
