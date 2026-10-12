@@ -23,9 +23,11 @@ use std::{
 /// case the dashboard just shows the running version with no verdict.
 pub type LatestVersion = Arc<Mutex<Option<String>>>;
 
-/// How often to re-check. Releases are rare; this only has to be often
-/// enough that a long-running container notices one within the day.
-const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// How often to re-check. Was 6 hours, which left a device that checked
+/// just before a release saying "Up to date" for most of a day while the
+/// web dashboard already showed the update. The request is one small static
+/// file, so hourly costs next to nothing.
+const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Where to look when UPDATE_CHECK_URL isn't set: the sibling `app.` host
 /// of API_URL's `api.` host (api.filegarden.net -> app.filegarden.net), the

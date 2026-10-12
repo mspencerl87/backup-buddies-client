@@ -362,8 +362,8 @@ and the web dashboard compares it to the version in `apps/client/Cargo.toml`
 that reports no version (anything before 0.2.0), gets an "update available"
 badge with the command above.
 
-Since 0.6.0 the client's own local dashboard does the same check: every 6
-hours it reads that same `/client/Cargo.toml` (the `app.` sibling of
+Since 0.6.0 the client's own local dashboard does the same check: every
+hour it reads that same `/client/Cargo.toml` (the `app.` sibling of
 `API_URL`'s `api.` host, or `UPDATE_CHECK_URL`; `off` disables it) and the
 "This Device" card shows "Up to date" or "Update available: x.y.z" with the
 update command for that install kind (the CI-built image sets
@@ -783,7 +783,7 @@ explanations.
 | `STALE_AFTER_SECS` | `600`, or 3× the scan interval if longer | How long without a successful cycle before the dashboard calls a buddy stale |
 | `DEFAULT_EXCLUDES` | on | `off` (or `false`, `0`, `no`) stops skipping the built-in list of poor fits (PST, live databases, VM disks, temp files). See "Excluding files" |
 | `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder sync as "everything deleted". Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
-| `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every 6 hours). `off` disables the check |
+| `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every hour). `off` disables the check |
 
 **Set by the image or compose file; don't set these yourself**
 
