@@ -14,7 +14,9 @@ pub const ALPN: &[u8] = b"backup-buddies/sync/1";
 /// 2 (client 0.5.0): PutStream.
 /// 3 (client 0.8.0): PutResumable.
 /// 4 (client 0.9.0): PurgeDeleted.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5 (client 0.16.0): RepoList/RepoRead/RepoWrite/RepoRemove, a buddy
+/// storing a chunked backup repository (see repo.rs).
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Largest file sent to a buddy whose client predates PutStream: the old
 /// Put needs the whole file's hash before sending, so the encrypted file is
@@ -108,6 +110,60 @@ pub enum SyncRequest {
     /// while a live file still exists at `path`, so it can only ever take
     /// away copies of something the sender already deleted.
     PurgeDeleted { path: String },
+    /// Protocol v5: "Which repository files of this kind do you hold for
+    /// me?" Answered with RepoListChunk frames (REPO_LIST_CHUNK_ENTRIES
+    /// each, last one `done: true`). The repository is a restic-format one
+    /// the sender builds with rustic_core: the buddy only ever stores,
+    /// lists and hands back opaque encrypted files, by kind and id.
+    RepoList { kind: RepoFileKind },
+    /// Protocol v5: "Send me `length` bytes of this repository file from
+    /// `offset`" (the rest of the file when `length` is None). Answered
+    /// with a RepoReadReply, then on success exactly that many raw bytes.
+    RepoRead { kind: RepoFileKind, id: String, offset: u64, length: Option<u64> },
+    /// Protocol v5: "Store this repository file." Followed by exactly `len`
+    /// raw bytes; answered with a SyncAck, or refused before the body like
+    /// a Put (STOP_SENDING with a PutRejectReason code).
+    RepoWrite { kind: RepoFileKind, id: String, len: u64 },
+    /// Protocol v5: "Remove this repository file." Answered with a SyncAck.
+    /// Idempotent, like Delete.
+    RepoRemove { kind: RepoFileKind, id: String },
+}
+
+/// The kinds of file in a restic-format repository (rustic_core's
+/// FileType). Every kind but Config is named by the SHA-256 of its
+/// contents, which the buddy checks on every write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoFileKind {
+    Config,
+    Index,
+    Key,
+    Snapshot,
+    Pack,
+}
+
+pub const REPO_LIST_CHUNK_ENTRIES: usize = 5000;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoFileEntry {
+    pub id: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoListChunk {
+    pub files: Vec<RepoFileEntry>,
+    pub done: bool,
+}
+
+/// Answer to RepoRead, before any file bytes: `len` is how many follow
+/// (None when the file isn't there or the range is bad, with `error`).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RepoReadReply {
+    #[serde(default)]
+    pub len: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Why a Put was rejected *before* its body was ever read (see

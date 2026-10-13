@@ -164,7 +164,7 @@ fn remove_empty_folders(sender_dir: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if top && (name == ".versions" || name == INCOMING_DIR) {
+            if top && (name == ".versions" || name == INCOMING_DIR || name == crate::repo::REPO_DIR) {
                 continue;
             }
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -308,10 +308,11 @@ pub async fn load_usage_ledger(data_dir: &Path) -> HashMap<String, u64> {
 }
 
 /// What each buddy actually has stored with us right now: the total size
-/// of their live files under BUDDY_FILES_DIR/<their node id>/ (not
-/// `.versions/` backup slots or half-received uploads — the same things
-/// the pledge counts). Used at startup to correct the saved ledger, which
-/// is a running total and can drift: files removed or a folder reset by
+/// of their live files under BUDDY_FILES_DIR/<their node id>/ plus their
+/// chunked-backup repository (not `.versions/` backup slots or
+/// half-received uploads — the same things the pledge counts). Used at
+/// startup to correct the saved ledger, which is a running total and can
+/// drift: files removed or a folder reset by
 /// hand, an older client's bookkeeping, a crash between writing a file and
 /// saving the ledger.
 pub async fn usage_from_disk(buddy_files_dir: &Path) -> HashMap<String, u64> {
@@ -323,7 +324,9 @@ pub async fn usage_from_disk(buddy_files_dir: &Path) -> HashMap<String, u64> {
             continue;
         }
         let live: u64 = list_sender_files(&entry.path()).await.iter().filter(|f| !f.deleted).map(|f| f.size).sum();
-        usage.insert(name, live);
+        // A chunked backup's repository counts in full (old snapshots too):
+        // it's all space this host is giving them.
+        usage.insert(name, live + crate::repo::repo_size(&entry.path()).await);
     }
     usage
 }
@@ -526,6 +529,43 @@ async fn handle_stream(
             handle_get_version(&mut send, &sender_dir, path, version, &data_dir, &bandwidth_book, &quality)
                 .await?;
         }
+        SyncRequest::RepoList { kind } => {
+            crate::repo::handle_list(&mut send, &sender_dir, kind).await?;
+        }
+        SyncRequest::RepoRead { kind, id, offset, length } => {
+            crate::repo::handle_read(
+                &mut send,
+                &sender_dir,
+                &data_dir,
+                &bandwidth_book,
+                &quality,
+                kind,
+                id,
+                offset,
+                length,
+            )
+            .await?;
+        }
+        SyncRequest::RepoWrite { kind, id, len } => {
+            crate::repo::handle_write(
+                &mut send,
+                &mut recv,
+                &sender_dir,
+                &remote_id,
+                &pledge_book,
+                &data_dir,
+                &buddy_files_dir,
+                &bandwidth_book,
+                &quality,
+                kind,
+                id,
+                len,
+            )
+            .await?;
+        }
+        SyncRequest::RepoRemove { kind, id } => {
+            crate::repo::handle_remove(&mut send, &sender_dir, &remote_id, &pledge_book, &data_dir, kind, id).await?;
+        }
     }
 
     send.stopped().await.ok();
@@ -550,9 +590,9 @@ pub(crate) fn safe_join(base: &Path, rel: &str) -> Option<PathBuf> {
 
 /// Where an admitted upload goes, and what it replaces (for undoing the
 /// pledge reservation if it doesn't complete).
-struct Admitted {
-    dest: PathBuf,
-    previous_size: u64,
+pub(crate) struct Admitted {
+    pub(crate) dest: PathBuf,
+    pub(crate) previous_size: u64,
 }
 
 /// The checks every upload passes before a byte of it is read: size, path,
@@ -560,7 +600,7 @@ struct Admitted {
 /// with `release_pledge` if the upload doesn't complete). `already_have` is
 /// what a resumed upload already holds on disk, so only the rest needs room.
 #[allow(clippy::too_many_arguments)]
-async fn admit_put(
+pub(crate) async fn admit_put(
     sender_dir: &Path,
     remote_id: &str,
     pledge_book: &PledgeBook,
@@ -628,7 +668,7 @@ async fn admit_put(
 }
 
 /// Undoes admit_put's pledge reservation for an upload that didn't land.
-fn release_pledge(pledge_book: &PledgeBook, remote_id: &str, ciphertext_len: u64, previous_size: u64) {
+pub(crate) fn release_pledge(pledge_book: &PledgeBook, remote_id: &str, ciphertext_len: u64, previous_size: u64) {
     let mut book = pledge_book.lock().unwrap();
     if let Some(state) = book.get_mut(remote_id) {
         state.received_bytes = state.received_bytes.saturating_sub(ciphertext_len).saturating_add(previous_size);
@@ -1020,7 +1060,7 @@ async fn append_body(recv: &mut iroh::endpoint::RecvStream, part: &Path, have: u
 // sender — which generally never gets to read the string ack below, since
 // it's usually still mid-write when the stop lands — can still learn
 // *why*, not just that it failed.
-async fn reject_without_reading_body(
+pub(crate) async fn reject_without_reading_body(
     recv: &mut iroh::endpoint::RecvStream,
     send: &mut iroh::endpoint::SendStream,
     reason: PutRejectReason,
@@ -1036,7 +1076,7 @@ async fn reject_without_reading_body(
 const INCOMING_DIR: &str = ".incoming";
 const IO_CHUNK: usize = 256 * 1024;
 
-async fn incoming_tmp_path(sender_dir: &Path) -> Result<PathBuf> {
+pub(crate) async fn incoming_tmp_path(sender_dir: &Path) -> Result<PathBuf> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = sender_dir.join(INCOMING_DIR);
     tokio::fs::create_dir_all(&dir).await.context("failed to create upload staging folder")?;
@@ -1047,7 +1087,7 @@ async fn incoming_tmp_path(sender_dir: &Path) -> Result<PathBuf> {
 /// Reads exactly `len` bytes from `recv` into a new file at `path`,
 /// returning their SHA-256. Flushed to disk before returning, so a file
 /// isn't acknowledged until it's actually stored.
-async fn receive_body(recv: &mut iroh::endpoint::RecvStream, path: &Path, len: u64) -> Result<String> {
+pub(crate) async fn receive_body(recv: &mut iroh::endpoint::RecvStream, path: &Path, len: u64) -> Result<String> {
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::File::create(path).await.context("failed to create upload file")?;
     let mut hasher = Sha256::new();
@@ -1302,8 +1342,11 @@ fn collect_files<'a>(
                 // Backup-version slots live under .versions/ — they're not
                 // restorable the normal way (ListVersions/GetVersion only),
                 // so they shouldn't show up as if they were live files.
+                // A chunked backup's repository (.repo/ at the top, see
+                // repo.rs) isn't files either: it's listed with RepoList.
                 let name = path.file_name().and_then(|n| n.to_str());
-                if name == Some(".versions") || name == Some(INCOMING_DIR) {
+                let repo = dir == base && name == Some(crate::repo::REPO_DIR);
+                if name == Some(".versions") || name == Some(INCOMING_DIR) || repo {
                     continue;
                 }
                 collect_files(base, &path, out).await;

@@ -561,3 +561,79 @@ async fn e2e_backup_restore_versions_and_compat() {
     eprintln!("peak RSS for the whole test: {} MB", peak_rss_mb());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Protocol v5: the buddy stores a chunked backup's repository files, by
+/// kind and id, checks each against its name, counts them against the
+/// pledge, and keeps them out of the whole-file listings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_repo_files() {
+    use crate::protocol::RepoFileKind::{Config, Index, Pack};
+    use sha2::{Digest, Sha256};
+
+    let root = std::env::temp_dir().join(format!("bb-e2e-repo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (config_b, buddy_files_b) = (root.join("b/config"), root.join("b/buddy-files"));
+    for d in [&config_b, &buddy_files_b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let lookup_a = MemoryLookup::new();
+    let ep_b = endpoint(vec![protocol::ALPN.to_vec()], MemoryLookup::new()).await;
+    let ep_a = endpoint(vec![protocol::ALPN.to_vec()], lookup_a.clone()).await;
+    lookup_a.add_endpoint_info(ep_b.addr());
+    let a_id = ep_a.id().to_string();
+    let pledge: PledgeBook = Arc::new(Mutex::new(HashMap::from([(
+        a_id.clone(),
+        PledgeState { pledged_bytes: 3_000_000, received_bytes: 0, account_id: None },
+    )])));
+    serve(ep_b.clone(), config_b.clone(), buddy_files_b.clone(), pledge.clone());
+    let conn = ep_a.connect(ep_b.addr(), protocol::ALPN).await.unwrap();
+    let id_of = |data: &[u8]| hex::encode(Sha256::digest(data));
+    let used = || pledge.lock().unwrap()[&a_id].received_bytes;
+
+    // Writes, lists and reads back, in part and whole.
+    let pack = pattern(1_000_000, 3);
+    let pack_id = id_of(&pack);
+    crate::repo::write(&conn, Pack, &pack_id, &pack).await.unwrap();
+    crate::repo::write(&conn, Config, crate::repo::CONFIG_ID, b"config bytes").await.unwrap();
+    let listed = crate::repo::list(&conn, Pack).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!((listed[0].id.as_str(), listed[0].size), (pack_id.as_str(), 1_000_000));
+    assert_eq!(crate::repo::list(&conn, Config).await.unwrap()[0].id, crate::repo::CONFIG_ID);
+    assert!(crate::repo::list(&conn, Index).await.unwrap().is_empty());
+    assert_eq!(crate::repo::read(&conn, Pack, &pack_id, 0, None).await.unwrap(), pack);
+    assert_eq!(crate::repo::read(&conn, Pack, &pack_id, 999_990, Some(10)).await.unwrap(), &pack[999_990..]);
+    assert!(crate::repo::read(&conn, Pack, &pack_id, 999_995, Some(10)).await.is_err(), "past the end");
+    assert_eq!(used(), 1_000_000 + 12);
+
+    // Bytes that don't match their name are refused and not kept.
+    let other = pattern(1000, 9);
+    assert!(crate::repo::write(&conn, Index, &id_of(b"something else"), &other).await.is_err());
+    assert!(crate::repo::list(&conn, Index).await.unwrap().is_empty());
+    assert_eq!(used(), 1_000_000 + 12, "a refused write gives its reservation back");
+
+    // A write past the pledge is refused before its bytes are read, with
+    // the same reason a whole-file upload gets.
+    let big = pattern(2_500_000, 5);
+    let err = crate::repo::write(&conn, Pack, &id_of(&big), &big).await.unwrap_err();
+    let refused = err.chain().any(|c| {
+        matches!(c.downcast_ref::<iroh::endpoint::WriteError>(),
+            Some(iroh::endpoint::WriteError::Stopped(code)) if protocol::PutRejectReason::from_code(code.into_inner()) == Some(protocol::PutRejectReason::PledgeExceeded))
+    }) || err.to_string().contains("pledge");
+    assert!(refused, "expected a pledge refusal, got {err:?}");
+
+    // Hidden from the whole-file listing, counted in usage from disk.
+    let sender_dir = buddy_files_b.join(&a_id);
+    assert!(crate::receive::list_sender_files(&sender_dir).await.is_empty());
+    assert!(crate::repo::repo_dir(&sender_dir).join("data").join(&pack_id[..2]).join(&pack_id).is_file());
+    assert_eq!(crate::receive::usage_from_disk(&buddy_files_b).await[&a_id], 1_000_000 + 12);
+
+    // Removing frees the pledge, and removing again is fine.
+    crate::repo::remove(&conn, Pack, &pack_id).await.unwrap();
+    crate::repo::remove(&conn, Pack, &pack_id).await.unwrap();
+    assert!(crate::repo::list(&conn, Pack).await.unwrap().is_empty());
+    assert_eq!(used(), 12);
+    assert!(crate::repo::read(&conn, Pack, &pack_id, 0, None).await.is_err());
+
+    conn.close(0u32.into(), b"done");
+    let _ = std::fs::remove_dir_all(&root);
+}

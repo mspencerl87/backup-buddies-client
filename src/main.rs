@@ -10,6 +10,7 @@ mod manifest;
 mod netinfo;
 mod protocol;
 mod receive;
+mod repo;
 mod crypto;
 #[cfg(test)]
 mod e2e_tests;

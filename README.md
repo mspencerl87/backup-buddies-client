@@ -464,6 +464,12 @@ Buddy files (`BUDDY_FILES_DIR`):
   kept when a file is overwritten or deleted (see "File versions" below).
   Deleting this folder just gives up that recovery history; it doesn't
   touch the live files.
+- `<buddy node id>/.repo/` — a buddy's chunked backup (client 0.16.0+
+  stores these; sending them comes in a later version): encrypted pack,
+  index and snapshot files in the restic repository layout, named by
+  their content hashes. It holds the whole backup, history included, and
+  counts against that buddy's pledge in full. Don't edit or delete
+  anything in it by hand; a missing pack loses whatever was in it.
 
 Restores (`RESTORE_DIR`): `<buddy node id>/...` — only appears after a
 restore.
