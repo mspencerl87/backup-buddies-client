@@ -532,17 +532,17 @@ hash of the whole thing checks out.
   can't be resumed from and the file starts over (once). Copies and
   partials nobody comes back for are deleted after 7 days.
 
-## Known issue: dropped connections on a local network
+## Known issue: dropped connections between two clients on one machine
 
-Occasionally a long transfer between buddies on the same local network
-loses its connection partway through, usually minutes in, logged as
+With two clients on the same machine backing up to each other, a long
+transfer occasionally loses its connection partway through, usually
+minutes in, logged as
 `failed closing path err=LastOpenPath` and then `connection lost` /
 `timed out`. The next cycle carries on: big files resume (above), smaller
-ones are re-sent. Seen so far only with two test clients on the same
-machine, where every interface address, including the Docker bridge
-(`docker0`, 172.17.0.1), is offered as a route; the cause isn't confirmed.
-If you run two clients on one host and see it often, that's the likely
-reason.
+ones are re-sent. Seen only with two clients on the same machine, where
+every interface address, including the Docker bridge (`docker0`,
+172.17.0.1), is offered as a route. Between two separate machines on one
+local network, about 21 GB over three long transfers ran clean.
 
 ## Large folders and large files (0.5.0)
 
