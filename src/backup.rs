@@ -114,6 +114,9 @@ pub struct CycleProgress {
     /// but weren't sent this cycle, so the speed leaves them out (after a
     /// resume it read "144 MB/s, ~3s left").
     pub bytes_skipped: u64,
+    /// A chunked backup (chunked.rs): rustic reports bytes read, not files
+    /// sent, so the dashboard shows it as one byte count.
+    pub chunked: bool,
     #[serde(skip)]
     current_counter: Arc<AtomicU64>,
     #[serde(skip)]

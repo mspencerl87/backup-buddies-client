@@ -223,9 +223,13 @@ struct BuddyStatus {
     received_bytes_counted: u64,
     received_files: usize,
     received_total_bytes: u64,
-    // What *we've* sent *them*, per our own manifest for that buddy.
+    // What *we've* sent *them*, per our own manifest for that buddy, or
+    // for a chunked backup, what its last snapshot holds.
     sent_files: usize,
     sent_bytes: u64,
+    sent_chunked: bool,
+    // Size of the chunked backup they keep with us (0 if none).
+    received_repo_bytes: u64,
     last_cycle: Option<CycleRecord>,
     // Live progress of a backup cycle running right now, if one is — see
     // backup::CycleProgress. Absent between cycles.
@@ -638,6 +642,11 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         // Encrypted bytes (comparable to the buddy's own received totals,
         // which are ciphertext too), straight from the index.
         let (sent_files, sent_bytes) = crate::index::get().sent_summary(&node_id).unwrap_or((0, 0));
+        let chunked_sent = crate::chunked::last_snapshot_summary(&node_id);
+        let (sent_files, sent_bytes) = match chunked_sent {
+            Some((files, bytes)) => (files as usize, bytes),
+            None => (sent_files, sent_bytes),
+        };
 
         let sender_dir = state.buddy_files_dir.join(&node_id);
         // Live files only: the listing also has deleted-but-recoverable
@@ -646,6 +655,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         let received: Vec<_> = receive::list_sender_files(&sender_dir).await.into_iter().filter(|f| !f.deleted).collect();
         let received_files = received.len();
         let received_total_bytes: u64 = received.iter().map(|f| f.size).sum();
+        let received_repo_bytes = crate::repo::repo_size(&sender_dir).await;
 
         // A buddy only counts as stale once we've actually tried and
         // failed — a brand-new pairing with no cycle yet gets the existing
@@ -666,6 +676,8 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             received_total_bytes,
             sent_files,
             sent_bytes,
+            sent_chunked: chunked_sent.is_some(),
+            received_repo_bytes,
             in_progress,
             last_cycle: cycle,
             stale,
@@ -1604,6 +1616,18 @@ function escapeHtml(text) {
 // One line + bar fraction for a backup cycle that's running right now
 // (status.buddies[].in_progress — see backup.rs's CycleProgress), so a
 // long first backup shows how far along it is instead of "no cycle yet".
+// What a buddy keeps with us: whole files by count, a chunked backup by
+// its stored size (its file count is inside it, encrypted), or both while
+// they move over.
+function receivedText(b) {
+  const parts = [];
+  if (b.received_files > 0 || !b.received_repo_bytes) {
+    parts.push(b.received_files + " file(s), " + fmtBytes(b.received_total_bytes));
+  }
+  if (b.received_repo_bytes) parts.push(fmtBytes(b.received_repo_bytes) + " chunked backup");
+  return parts.join(" + ");
+}
+
 function describeCycleProgress(p) {
   const n = (x) => Number(x).toLocaleString();
   const curFrac = p.current_size > 0 ? Math.min(1, p.current_done / p.current_size) : 0;
@@ -1625,6 +1649,19 @@ function describeCycleProgress(p) {
   }
   const done = Math.min(p.bytes_to_send, p.bytes_sent + p.current_done);
   const frac = p.bytes_to_send > 0 ? done / p.bytes_to_send : (p.files_to_send > 0 ? p.files_sent / p.files_to_send : 0);
+  // A chunked backup reads every file but sends only new chunks, and
+  // reports bytes read rather than files sent.
+  if (p.chunked) {
+    let line = "Backing up in chunks — " + fmtBytes(done) + " of " + fmtBytes(p.bytes_to_send) + " read (" +
+      Math.floor(frac * 100) + "%), " + n(p.files_to_send) + " file(s)";
+    const elapsed = p.sending_started_unix ? p.now_unix - p.sending_started_unix : 0;
+    const remaining = p.bytes_to_send - done;
+    if (elapsed >= 5 && done > 0 && remaining > 0) {
+      const rate = done / elapsed;
+      line += " — ~" + fmtEta(remaining / rate) + " left at " + fmtBytes(rate) + "/s";
+    }
+    return { frac, line };
+  }
   let line = "Backing up " + n(Math.min(p.files_sent + 1, p.files_to_send)) + " of " + n(p.files_to_send) + " file(s)";
   // After upgrading to 0.14.0, files already backed up go once more under
   // encrypted names; without this it looks like everything changed.
@@ -2512,11 +2549,11 @@ function renderBuddy(b) {
     <div class="row" style="margin-top: 0.9rem;">
       <div>
         <div class="muted">You've sent them</div>
-        <div>${b.sent_files} file(s), ${fmtBytes(b.sent_bytes)}</div>
+        <div>${b.sent_files} file(s), ${fmtBytes(b.sent_bytes)}${b.sent_chunked ? " in the last snapshot" : ""}</div>
       </div>
       <div>
         <div class="muted">They've sent you</div>
-        <div>${b.received_files} file(s), ${fmtBytes(b.received_total_bytes)}</div>
+        <div>${receivedText(b)}</div>
       </div>
     </div>
     <div style="margin-top: 0.75rem;">

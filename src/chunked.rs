@@ -116,8 +116,10 @@ struct State {
     /// snapshot: when it matches, nothing changed and the cycle is idle.
     fingerprint: String,
     /// How many files that snapshot held (for the missing-drive check and
-    /// counting deletions).
+    /// counting deletions), and their total size.
     files: u64,
+    #[serde(default)]
+    bytes: u64,
     last_retention_unix: u64,
 }
 
@@ -133,6 +135,17 @@ fn state_path(buddy: &str) -> PathBuf {
 /// whole files again, so that's what there is to browse.
 pub(crate) fn has_repo(buddy: &str) -> bool {
     enabled() && state_path(buddy).is_file()
+}
+
+/// Files and bytes in the last snapshot saved to this buddy, for the
+/// dashboard's "You've sent them" (our whole-file record of what was sent
+/// doesn't apply to a chunked backup).
+pub(crate) fn last_snapshot_summary(buddy: &str) -> Option<(u64, u64)> {
+    if !has_repo(buddy) {
+        return None;
+    }
+    let state: State = serde_json::from_slice(&std::fs::read(state_path(buddy)).ok()?).ok()?;
+    Some((state.files, state.bytes))
 }
 
 /// rustic's options for any repository on a buddy: the shared cache under
@@ -245,13 +258,16 @@ pub(crate) async fn run_chunked_cycle(
     let quality = netinfo::connection_quality(&conn);
 
     let total_bytes: u64 = scan.files.iter().map(|f| f.size).sum();
+    // rustic's byte counter (CycleProgressBars) drives the bar through
+    // the tracker's per-file counter, over every byte it reads.
     tracker.update(|p| {
         p.phase = "sending";
+        p.chunked = true;
         p.bytes_to_send = total_bytes;
         p.files_to_send = scan.files.len();
+        p.current_size = total_bytes;
         p.sending_started_unix = Some(crate::dashboard::unix_now());
     });
-    tracker.start_file("all files (chunked)", total_bytes);
 
     let backend = Arc::new(BuddyBackend::new(endpoint.clone(), relay_url.clone(), buddy_id, Some(conn.clone())));
     let job = {
@@ -297,6 +313,7 @@ pub(crate) async fn run_chunked_cycle(
         stats.files_deleted = state.files.saturating_sub(changed + unmodified) as usize;
         stats.bytes_sent = s.map(|s| s.data_added_packed).unwrap_or(0);
         state.files = total;
+        state.bytes = s.map(|s| s.total_bytes_processed).unwrap_or(0);
         state.fingerprint = fp;
         tracing::info!(
             buddy = %buddy,
