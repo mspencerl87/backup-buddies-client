@@ -755,6 +755,66 @@ async fn e2e_chunked_backup() {
     .unwrap();
     assert!(restored.as_ref() == edited.as_slice(), "restored bytes match the edited file");
 
+    // Phase 3: the same backup through Browse files, History and restores.
+    std::fs::remove_file(mine.join("photos/holiday/img00.jpg")).unwrap();
+    let s = cycle().await.unwrap();
+    assert_eq!((s.files_sent, s.files_deleted), (0, 1));
+    let buddy = b_id.to_string();
+    assert!(crate::chunked::has_repo(&buddy));
+    let listing = crate::chunked_restore::list(&ep_a, &relay, b_id).await.unwrap();
+    let live: Vec<_> = listing.files.iter().filter(|f| !f.deleted).map(|f| f.path.as_str()).collect();
+    let gone: Vec<_> = listing.files.iter().filter(|f| f.deleted).map(|f| f.path.as_str()).collect();
+    assert_eq!(live.len(), 20, "19 photos and the video: {live:?}");
+    assert!(live.contains(&"videos/renamed.bin") && live.contains(&"photos/holiday/img05.jpg"));
+    // Earlier paths that no longer exist show as deleted, still restorable.
+    for path in ["photos/holiday/img00.jpg", "videos/clip.bin", "photos/2024/img05.jpg"] {
+        assert!(gone.contains(&path), "{path} not listed as deleted: {gone:?}");
+    }
+    assert!(!listing.packs.is_empty() && listing.packs.iter().all(|p| crate::chunked_restore::pack_id(&p.remote).is_some()));
+
+    // Restore everything live, through the dashboard's entry point.
+    let restored_dir = root.join("a/restored");
+    let stats = crate::restore::restore_selected(
+        &ep_a,
+        &relay,
+        &SecretString::from(PASS.to_string()),
+        b_id,
+        &restored_dir,
+        &listing.files,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.files_restored, 20);
+    assert_eq!(std::fs::read(restored_dir.join("videos/renamed.bin")).unwrap(), edited);
+    assert_eq!(
+        std::fs::read(restored_dir.join("photos/holiday/img05.jpg")).unwrap(),
+        std::fs::read(mine.join("photos/holiday/img05.jpg")).unwrap()
+    );
+    assert!(!restored_dir.join("photos/holiday/img00.jpg").exists(), "deleted files aren't restored with the rest");
+
+    // History: the edited file has one earlier content (before the edit);
+    // the deleted photo has its last one. Each restores next to the file.
+    let versions = crate::restore::list_file_versions(&ep_a, &relay, b_id, "videos/renamed.bin").await.unwrap();
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    crate::restore::restore_version(&ep_a, &relay, &SecretString::from(PASS.to_string()), b_id, &restored_dir, "videos/renamed.bin", 1)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(restored_dir.join("videos/renamed.bin.v1.bak")).unwrap(), big);
+    let versions = crate::restore::list_file_versions(&ep_a, &relay, b_id, "photos/holiday/img00.jpg").await.unwrap();
+    assert_eq!(versions.len(), 1);
+    crate::restore::restore_version(&ep_a, &relay, &SecretString::from(PASS.to_string()), b_id, &restored_dir, "photos/holiday/img00.jpg", 1)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(restored_dir.join("photos/holiday/img00.jpg.v1.bak")).unwrap(), noise(50_000, 100));
+    // "Delete permanently" isn't offered for chunked backups.
+    assert!(crate::restore::purge_deleted(&ep_a, &relay, b_id, "photos/holiday/img00.jpg").await.is_err());
+
+    // "What your buddy sees": a pack's first bytes, as stored (encrypted).
+    let first = &listing.packs[0];
+    let peek = crate::restore::peek_buddy_file(&ep_a, &relay, b_id, &first.remote, 256).await.unwrap();
+    assert_eq!(peek.len() as u64, first.size.min(256));
+
     // 6. A buddy whose pledge is full refuses the next pack, and the cycle
     // says so in the same words a whole-file refusal uses.
     pledge.lock().unwrap().get_mut(&a_id).unwrap().pledged_bytes = 1;

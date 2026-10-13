@@ -745,6 +745,20 @@ async fn files_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "not a valid Iroh node id".to_string()).into_response(),
     };
 
+    // A chunked backup also sends its pack files: that's what the buddy's
+    // disk actually holds, for "What your buddy sees".
+    if crate::chunked::has_repo(&node_id_str) {
+        return match crate::chunked_restore::list(&state.endpoint, &state.relay_url, buddy_id).await {
+            Ok(listing) => {
+                Json(serde_json::json!({ "files": listing.files, "stored": listing.packs, "chunked": true }))
+                    .into_response()
+            }
+            Err(err) => {
+                (StatusCode::BAD_GATEWAY, format!("couldn't read your chunked backup on this buddy: {err}"))
+                    .into_response()
+            }
+        };
+    }
     match crate::restore::list_buddy_files(&state.endpoint, &state.relay_url, buddy_id).await {
         Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
         Err(err) => {
@@ -1810,6 +1824,8 @@ const browseState = {
   nodeId: null,
   label: "",
   files: [], // flat, as returned by the server
+  stored: null, // a chunked backup's pack files, as the buddy stores them
+  chunked: false,
   tree: null, // built from files by buildFileTree()
   currentPath: "", // "" = root; "testdir"; "a/b"; ... — folder currently open
   selected: new Set(),
@@ -1870,13 +1886,16 @@ async function peekStored(file, row) {
 
 function renderBuddyView() {
   // Deleted files only survive as old copies, which a plain Get can't
-  // fetch, so the view sticks to live ones.
-  const live = browseState.files.filter((f) => !f.deleted)
-    .sort((a, b) => a.remote.localeCompare(b.remote));
+  // fetch, so the view sticks to live ones. A chunked backup is held as
+  // encrypted pack files instead, which is all the buddy's disk shows.
+  const live = (browseState.stored || browseState.files.filter((f) => !f.deleted))
+    .slice().sort((a, b) => a.remote.localeCompare(b.remote));
   const total = live.reduce((sum, f) => sum + f.size, 0);
+  const noun = browseState.stored ? "encrypted pack file" : "file";
   buddyViewIntro.textContent = live.length
-    ? browseState.label + " holds " + live.length + " file" + (live.length === 1 ? "" : "s") +
-      " of yours, " + fmtBytes(total) + " in all. Here's the list as it sits on their disk."
+    ? browseState.label + " holds " + live.length + " " + noun + (live.length === 1 ? "" : "s") +
+      " of yours, " + fmtBytes(total) + " in all. Here's the list as it sits on their disk." +
+      (browseState.stored ? " Your file names, sizes and folders are inside them, encrypted." : "")
     : browseState.label + " isn't holding any files of yours yet.";
   storedList.innerHTML = "";
   for (const f of live.slice(0, STORED_ROWS_SHOWN)) {
@@ -1917,6 +1936,8 @@ function closeBrowseModal() {
   browseModal.classList.remove("open");
   browseState.nodeId = null;
   browseState.files = [];
+  browseState.stored = null;
+  browseState.chunked = false;
   browseState.tree = null;
   browseState.currentPath = "";
   browseState.selected.clear();
@@ -2017,7 +2038,7 @@ function makeFileRow(item) {
     <span class="size">${fmtBytes(item.size)}</span>
     ${item.deleted ? "" : '<button class="secondary file-restore-one">Restore</button>'}
     <button class="secondary file-history-toggle">History</button>
-    ${item.deleted ? '<button class="secondary file-purge" style="color: var(--danger);">Delete permanently</button>' : ""}
+    ${item.deleted && !browseState.chunked ? '<button class="secondary file-purge" style="color: var(--danger);">Delete permanently</button>' : ""}
   `;
   const history = document.createElement("div");
   history.className = "file-history";
@@ -2262,6 +2283,8 @@ async function openBrowseModal(nodeId, label) {
   browseState.nodeId = nodeId;
   browseState.label = label;
   browseState.files = [];
+  browseState.stored = null;
+  browseState.chunked = false;
   browseState.tree = null;
   browseState.currentPath = "";
   browseState.selected.clear();
@@ -2279,6 +2302,8 @@ async function openBrowseModal(nodeId, label) {
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
     browseState.files = (body.files || []).slice().sort((a, b) => a.path.localeCompare(b.path));
+    browseState.stored = body.stored || null;
+    browseState.chunked = !!body.chunked;
     browseState.tree = buildFileTree(browseState.files);
     renderBrowseView();
     browseBuddyViewBtn.disabled = false;

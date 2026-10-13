@@ -13,6 +13,7 @@ mod receive;
 mod repo;
 mod repo_backend;
 mod chunked;
+mod chunked_restore;
 mod crypto;
 #[cfg(test)]
 mod e2e_tests;
@@ -128,7 +129,9 @@ impl Config {
         // the guard against an unmounted drive wiping the buddy's copy.
         if backup::allow_empty_backup_dir() {
             tracing::warn!(
-                "ALLOW_EMPTY_BACKUP_DIR is on: if the drive with your files isn't mounted, its empty                  folder will be mirrored to your buddy as \"everything deleted\". Remove it from .env                  once your deliberate cleanup has synced."
+                "ALLOW_EMPTY_BACKUP_DIR is on: if the drive with your files isn't mounted, its empty \
+                 folder will be mirrored to your buddy as \"everything deleted\". Remove it from .env \
+                 once your deliberate cleanup has synced."
             );
         }
         let relay_url = std::env::var("RELAY_URL")
@@ -537,12 +540,19 @@ async fn main() -> Result<()> {
     // entirely rather than layering on top of it.
     // Same log to stdout as before, plus a colourless copy of the recent
     // lines in memory for the dashboard's Raw log tab (activity.rs).
+    // rustic_core (chunked backups) logs "using cache at …" and the like at
+    // info on every snapshot; only its warnings matter here, even under a
+    // RUST_LOG set for debugging something else (seen on a test device).
+    // A RUST_LOG that names rustic itself wins.
     {
         use tracing_subscriber::prelude::*;
+        let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,swarm_discovery=warn"));
+        if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("rustic")) {
+            filter = filter.add_directive("rustic_core=warn".parse().expect("valid directive"));
+        }
         tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-                |_| tracing_subscriber::EnvFilter::new("info,swarm_discovery=warn"),
-            ))
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
             .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(activity::RawLogWriter))
             .init();
@@ -1195,10 +1205,15 @@ async fn main() -> Result<()> {
                                 // drift that never shows up as a local file
                                 // change in the first place (see
                                 // backup::reconcile_with_buddy's doc comment).
-                                let reconcile_due = last_reconcile
-                                    .get(node_id_str)
-                                    .map(|at: &std::time::Instant| at.elapsed() >= RECONCILE_INTERVAL)
-                                    .unwrap_or(true);
+                                // Not for a chunked backup: it compares whole
+                                // files only ("0 files match"), and the buddy
+                                // already checks every repository file
+                                // against its content hash as it arrives.
+                                let reconcile_due = !chunked::has_repo(node_id_str)
+                                    && last_reconcile
+                                        .get(node_id_str)
+                                        .map(|at: &std::time::Instant| at.elapsed() >= RECONCILE_INTERVAL)
+                                        .unwrap_or(true);
                                 if reconcile_due {
                                     last_reconcile
                                         .insert(node_id_str.clone(), std::time::Instant::now());

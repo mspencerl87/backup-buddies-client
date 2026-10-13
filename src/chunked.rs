@@ -68,7 +68,7 @@ pub fn init(data_dir: &Path) {
     let _ = DATA_DIR.set(data_dir.join("chunked"));
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     DATA_DIR.get().cloned().unwrap_or_else(|| PathBuf::from("/data/chunked"))
 }
 
@@ -124,6 +124,22 @@ fn state_path(buddy: &str) -> PathBuf {
     state_dir().join(format!("{buddy}.json"))
 }
 
+/// Whether we keep a chunked backup with this buddy (a snapshot was saved
+/// to it at some point), so Browse files, restores and History read it
+/// rather than whole files.
+pub(crate) fn has_repo(buddy: &str) -> bool {
+    state_path(buddy).is_file()
+}
+
+/// rustic's options for any repository on a buddy: the shared cache under
+/// DATA_DIR, so index and tree data aren't fetched over the network each
+/// time.
+pub(crate) fn repo_options() -> RepositoryOptions {
+    let mut opts = RepositoryOptions::default();
+    opts.cache_dir = Some(state_dir().join("cache"));
+    opts
+}
+
 async fn load_state(buddy: &str) -> State {
     match tokio::fs::read(state_path(buddy)).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -151,7 +167,7 @@ fn fingerprint(scan: &backup::LocalScan) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn master_key() -> MasterKey {
+pub(crate) fn master_key() -> MasterKey {
     use base64::Engine as _;
     let key = crate::crypto::repo_key();
     let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
@@ -313,7 +329,7 @@ fn snapshot_and_tidy(
     retention_due: bool,
 ) -> Result<Outcome> {
     let backends = RepositoryBackends::new(backend.clone(), None);
-    let mut opts = RepositoryOptions::default();
+    let mut opts = repo_options();
     opts.cache_dir = Some(cache);
     let creds = Credentials::Masterkey(master_key());
     let repo = Repository::new_with_progress(&opts, &backends, CycleProgressBars { counter })?;

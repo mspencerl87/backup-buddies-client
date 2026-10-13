@@ -263,7 +263,9 @@ pub async fn run_backup_cycle(
     {
         if scan.excluded > 0 {
             anyhow::bail!(
-                "your exclude list (excludes.txt in the config folder) leaves nothing in your backup folder to                  back up, but {} file(s) from it are backed up with this buddy — not deleting them all.                  Check it for a pattern that's broader than you meant, like `*` or `**`.",
+                "your exclude list (excludes.txt in the config folder) leaves nothing in your backup \
+                 folder to back up, but {} file(s) from it are backed up with this buddy — not deleting \
+                 them all. Check it for a pattern that's broader than you meant, like `*` or `**`.",
                 sent.len()
             );
         }

@@ -101,6 +101,9 @@ pub async fn list_buddy_files(
     relay_url: &RelayUrl,
     buddy_id: EndpointId,
 ) -> Result<Vec<BuddyFile>> {
+    if crate::chunked::has_repo(&buddy_id.to_string()) {
+        return Ok(crate::chunked_restore::list(endpoint, relay_url, buddy_id).await?.files);
+    }
     Ok(decode_listing(list_buddy_entries(endpoint, relay_url, buddy_id).await?))
 }
 
@@ -144,6 +147,9 @@ pub async fn list_file_versions(
     buddy_id: EndpointId,
     path: &str,
 ) -> Result<Vec<VersionEntry>> {
+    if crate::chunked::has_repo(&buddy_id.to_string()) {
+        return crate::chunked_restore::list_versions(endpoint, relay_url, buddy_id, path).await;
+    }
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     // The first name with any copies: right after a file moved to its
     // encrypted name, its older copies are still under the plaintext one.
@@ -172,6 +178,10 @@ pub async fn restore_version(
     path: &str,
     version: u32,
 ) -> Result<RestoreStats> {
+    if crate::chunked::has_repo(&buddy_id.to_string()) {
+        return crate::chunked_restore::restore_version(endpoint, relay_url, buddy_id, restore_dir, path, version)
+            .await;
+    }
     let started = std::time::Instant::now();
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Received);
@@ -217,6 +227,12 @@ pub async fn purge_deleted(
     buddy_id: EndpointId,
     path: &str,
 ) -> Result<()> {
+    if crate::chunked::has_repo(&buddy_id.to_string()) {
+        anyhow::bail!(
+            "a chunked backup keeps this file in its older snapshots, which can't be cut down file by \
+             file; they're removed after 30 days"
+        );
+    }
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     if crate::backup::buddy_protocol_version(&conn).await < 4 {
         anyhow::bail!("your buddy's client is too old for this — it'll work once they update (the copies are removed after 30 days anyway)");
@@ -335,6 +351,11 @@ pub async fn run_restore(
     buddy_id: EndpointId,
     restore_dir: &Path,
 ) -> Result<RestoreStats> {
+    if crate::chunked::has_repo(&buddy_id.to_string()) {
+        let files = crate::chunked_restore::list(endpoint, relay_url, buddy_id).await?.files;
+        return crate::chunked_restore::restore_files(endpoint, relay_url, buddy_id, restore_dir, &files, None)
+            .await;
+    }
     let started = std::time::Instant::now();
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Received);
@@ -374,6 +395,10 @@ pub async fn restore_selected(
     files: &[BuddyFile],
     progress: Option<ProgressHandle>,
 ) -> Result<RestoreStats> {
+    if crate::chunked::has_repo(&buddy_id.to_string()) {
+        return crate::chunked_restore::restore_files(endpoint, relay_url, buddy_id, restore_dir, files, progress)
+            .await;
+    }
     let started = std::time::Instant::now();
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Received);
@@ -441,6 +466,10 @@ pub async fn peek_buddy_file(
     remote: &str,
     max: usize,
 ) -> Result<Vec<u8>> {
+    // A chunked backup's "files" on the buddy's disk are its pack files.
+    if let Some(id) = crate::chunked_restore::pack_id(remote) {
+        return crate::chunked_restore::peek_pack(endpoint, relay_url, buddy_id, id, max as u64).await;
+    }
     let conn = connect(endpoint, relay_url, buddy_id).await?;
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(&mut send, &SyncRequest::Get { path: remote.to_string() }).await?;
