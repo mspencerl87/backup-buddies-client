@@ -1,6 +1,6 @@
 [package]
 name = "backup-buddies-client"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["Spencer LeBlanc"]
@@ -69,3 +69,6 @@ bytes = "1.12"
 # The chunked-backup master key is handed to rustic_core in its serialized
 # (base64) form (chunked.rs). Already in the tree; same version.
 base64 = "0.22"
+# Caps the CPUs a chunked backup's threads run on (chunked.rs's CpuCap).
+# Already in the tree; same version.
+libc = "0.2"

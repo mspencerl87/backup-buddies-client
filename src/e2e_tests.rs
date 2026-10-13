@@ -684,14 +684,39 @@ async fn e2e_chunked_backup() {
         write(&mine, &format!("photos/2024/img{i:02}.jpg"), &noise(50_000, 100 + i));
     }
     let cycle = || crate::chunked::run_chunked_cycle(&ep_a, &relay, &mine, b_id, None);
+    let sender_dir = buddy_files_b.join(&a_id);
 
     // 1. First backup: everything goes, into the repository only.
     let s = cycle().await.unwrap();
     assert_eq!(s.files_sent, 21);
     assert!(s.bytes_sent > 32_500_000, "sent {}", s.bytes_sent);
-    let sender_dir = buddy_files_b.join(&a_id);
     assert!(crate::receive::list_sender_files(&sender_dir).await.is_empty(), "no whole files");
     assert!(crate::repo::repo_size(&sender_dir).await > 32_500_000);
+
+    // Moving off whole files: copies sent the old way (recorded in an
+    // index of their own here, since the real one is shared with the
+    // whole-file e2e test) are deleted on the buddy, so they're kept
+    // there as 30-day backup copies, and forgotten here.
+    let idx = crate::index::Index::open_at(&config_a.join("retire-test.sqlite")).unwrap();
+    let conn = ep_a.connect(ep_b.addr(), protocol::ALPN).await.unwrap();
+    for rel in ["photos/2024/img01.jpg", "photos/2024/img02.jpg"] {
+        let remote = crate::names::encrypt_path(rel).unwrap();
+        let abs = mine.join(rel);
+        let size = std::fs::metadata(&abs).unwrap().len();
+        let ciphertext_size = crate::backup::put_one_file(&conn, &remote, &abs, size, None).await.unwrap();
+        let entry = crate::index::SentEntry {
+            size,
+            sha256: String::new(),
+            ciphertext_size,
+            name_scheme: crate::names::SCHEME_N1,
+        };
+        idx.record_sent(&b_id.to_string(), rel, &entry).unwrap();
+    }
+    assert_eq!(crate::receive::list_sender_files(&sender_dir).await.len(), 2);
+    crate::chunked::retire_whole_files(&idx, &ep_a, &relay, b_id, &conn).await;
+    let whole = crate::receive::list_sender_files(&sender_dir).await;
+    assert!(whole.len() == 2 && whole.iter().all(|f| f.deleted), "whole files retired: {whole:?}");
+    assert!(idx.sent_entries(&b_id.to_string()).unwrap().is_empty());
 
     // 2. Nothing changed, but retention is due right after the first
     // snapshot: it runs (prune finds nothing), sending no files.

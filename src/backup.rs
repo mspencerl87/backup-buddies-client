@@ -1150,7 +1150,7 @@ async fn put_one_file_legacy(
     Ok(ciphertext_len)
 }
 
-async fn delete_one_file(conn: &iroh::endpoint::Connection, remote_path: &str) -> Result<()> {
+pub(crate) async fn delete_one_file(conn: &iroh::endpoint::Connection, remote_path: &str) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(&mut send, &SyncRequest::Delete { path: remote_path.to_string() }).await?;
     send.finish().context("failed to finish send stream")?;

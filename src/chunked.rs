@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Spencer LeBlanc
 
-//! Chunked backups, the sender's side (CHUNKED_TRANSFERS=on).
+//! Chunked backups, the sender's side (on unless CHUNKED_TRANSFERS=off).
 //!
 //! Instead of one encrypted copy per file, each buddy gets a restic-format
 //! repository built with rustic_core and stored on their side (repo.rs,
@@ -14,7 +14,7 @@
 //! re-send everything.
 //!
 //! Only with buddies on client 0.16.0+ (protocol v5); older ones keep
-//! getting whole files. Opt-in while restores from it are being built.
+//! getting whole files. The default since 0.19.0.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,9 +58,10 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Buddies found too old for chunked backups, and when.
 static TOO_OLD: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// On unless CHUNKED_TRANSFERS says off (the default since 0.19.0).
 pub fn enabled() -> bool {
-    std::env::var("CHUNKED_TRANSFERS")
-        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes"))
+    !std::env::var("CHUNKED_TRANSFERS")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "false" | "0" | "no"))
 }
 
 /// Where per-buddy state and rustic's cache live (`DATA_DIR/chunked/`).
@@ -127,8 +128,11 @@ fn state_path(buddy: &str) -> PathBuf {
 /// Whether we keep a chunked backup with this buddy (a snapshot was saved
 /// to it at some point), so Browse files, restores and History read it
 /// rather than whole files.
+///
+/// Not while chunked backups are turned off: backups to that buddy are
+/// whole files again, so that's what there is to browse.
 pub(crate) fn has_repo(buddy: &str) -> bool {
-    state_path(buddy).is_file()
+    enabled() && state_path(buddy).is_file()
 }
 
 /// rustic's options for any repository on a buddy: the shared cache under
@@ -264,7 +268,7 @@ pub(crate) async fn run_chunked_cycle(
     let outcome = job.await.context("chunked backup task failed");
     backend.close();
     let outcome = outcome?;
-    let traffic = meter.finish(&backend.connection_now().unwrap_or(conn));
+    let traffic = meter.finish(&backend.connection_now().unwrap_or_else(|| conn.clone()));
 
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -309,7 +313,141 @@ pub(crate) async fn run_chunked_cycle(
     if let Err(err) = save_state(&buddy, &state).await {
         tracing::warn!(?err, "couldn't save chunked backup state — the next cycle will check everything again");
     }
+
+    // The whole-file copies sent before chunked backups are redundant now
+    // that a snapshot holds the same files. Only after a snapshot of a
+    // folder read in full, so nothing that couldn't be read this time
+    // loses its only copy.
+    if outcome.snapshot.is_some()
+        && state.files > 0
+        && scan.unreadable.is_empty()
+        && let Some(idx) = crate::index::try_get()
+    {
+        retire_whole_files(idx, endpoint, relay_url, buddy_id, &conn).await;
+    }
     Ok(stats)
+}
+
+/// Deletes, on the buddy, every whole file we sent it before chunked
+/// backups (and plaintext-named copies left from 0.14.0's renaming). Like
+/// any delete, each becomes a backup copy there for 30 days. Our record of
+/// them goes as they do, so this runs once; a failure is retried after the
+/// next snapshot.
+pub(crate) async fn retire_whole_files(
+    idx: &crate::index::Index,
+    endpoint: &Endpoint,
+    relay_url: &RelayUrl,
+    buddy_id: EndpointId,
+    conn: &iroh::endpoint::Connection,
+) {
+    let buddy = buddy_id.to_string();
+    let (Ok(sent), Ok(old_names)) = (idx.sent_entries(&buddy), idx.old_names(&buddy)) else { return };
+    if sent.is_empty() && old_names.is_empty() {
+        return;
+    }
+    let conn = if conn.close_reason().is_none() {
+        conn.clone()
+    } else {
+        let addr = EndpointAddr::new(buddy_id).with_relay_url(relay_url.clone());
+        match endpoint.connect(addr, protocol::ALPN).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(%err, "couldn't reach the buddy to retire whole-file copies — will try after the next snapshot");
+                return;
+            }
+        }
+    };
+    let mut retired = 0;
+    for (path, entry) in &sent {
+        let Ok(remote) = crate::names::remote_path(path, entry.name_scheme) else { continue };
+        match backup::delete_one_file(&conn, &remote).await {
+            Ok(()) => {
+                let _ = idx.forget_sent(&buddy, std::slice::from_ref(path));
+                retired += 1;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "couldn't retire a whole-file copy — will try after the next snapshot");
+                return;
+            }
+        }
+    }
+    for path in &old_names {
+        if backup::delete_one_file(&conn, path).await.is_ok() {
+            let _ = idx.forget_old_name(&buddy, path);
+        }
+    }
+    if retired > 0 {
+        tracing::info!(buddy = %buddy, files = retired, "whole-file copies retired now that a chunked snapshot holds them");
+        crate::activity::record(
+            crate::activity::kind::BACKUP,
+            Some(&crate::activity::label(&buddy)),
+            format!(
+                "Moved to a chunked backup: {} sent the old way are kept as backup copies for 30 days",
+                crate::activity::plural(retired, "file")
+            ),
+            Vec::new(),
+        );
+    }
+}
+
+/// Most CPUs a backup's rustic threads run on. rustic sizes its thread
+/// pools to the CPUs it can see: a backup peaked at ~560 MB on 16 CPUs and
+/// ~250 MB on 2 in testing, and a buddy box is usually busy with other
+/// things too.
+const MAX_BACKUP_CPUS: usize = 4;
+
+/// Narrows the calling thread to MAX_BACKUP_CPUS CPUs until dropped.
+/// rustic's pools (pariter's available_parallelism, rayon's) follow the
+/// affinity of the thread that starts them, and threads inherit it. Put
+/// back afterwards, since tokio reuses this blocking thread.
+struct CpuCap {
+    #[cfg(target_os = "linux")]
+    saved: Option<libc::cpu_set_t>,
+}
+
+impl CpuCap {
+    #[cfg(target_os = "linux")]
+    fn new() -> Self {
+        // SAFETY: plain libc calls on a zeroed cpu_set_t for this thread
+        // (pid 0); a failure leaves the affinity as it was.
+        let saved = unsafe {
+            let size = std::mem::size_of::<libc::cpu_set_t>();
+            let mut current: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, size, &mut current) != 0
+                || (libc::CPU_COUNT(&current) as usize) <= MAX_BACKUP_CPUS
+            {
+                None
+            } else {
+                let mut narrowed: libc::cpu_set_t = std::mem::zeroed();
+                let mut taken = 0;
+                for cpu in 0..libc::CPU_SETSIZE as usize {
+                    if taken < MAX_BACKUP_CPUS && libc::CPU_ISSET(cpu, &current) {
+                        libc::CPU_SET(cpu, &mut narrowed);
+                        taken += 1;
+                    }
+                }
+                (libc::sched_setaffinity(0, size, &narrowed) == 0).then_some(current)
+            }
+        };
+        Self { saved }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Drop for CpuCap {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(saved) = &self.saved {
+            // SAFETY: restores the mask read in new().
+            unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), saved);
+            }
+        }
+    }
 }
 
 struct Outcome {
@@ -328,6 +466,7 @@ fn snapshot_and_tidy(
     do_backup: bool,
     retention_due: bool,
 ) -> Result<Outcome> {
+    let _cap = CpuCap::new();
     let backends = RepositoryBackends::new(backend.clone(), None);
     let mut opts = repo_options();
     opts.cache_dir = Some(cache);
@@ -568,6 +707,26 @@ mod tests {
         // Within a day: all kept. 30 h and 47 h: the older of each hour's
         // pair goes. 72 h and 29 days: one per day. 31 days: both go.
         assert_eq!(forgotten, ["30b", "47b", "696b", "72b", "744a", "744b"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_cap_narrows_this_thread_and_puts_it_back() {
+        let count = || {
+            // SAFETY: reads this thread's affinity into a zeroed set.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+                libc::CPU_COUNT(&set) as usize
+            }
+        };
+        let before = count();
+        {
+            let _cap = CpuCap::new();
+            assert_eq!(count(), before.min(MAX_BACKUP_CPUS));
+            assert_eq!(std::thread::available_parallelism().unwrap().get(), before.min(MAX_BACKUP_CPUS));
+        }
+        assert_eq!(count(), before);
     }
 
     #[test]

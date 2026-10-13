@@ -760,10 +760,10 @@ a monthly relay allowance instead (shown on the billing card); past it,
 buddy syncing pauses until the 1st of the next month, or until the
 account subscribes.
 
-## Chunked backups (testing)
+## Chunked backups
 
-With `CHUNKED_TRANSFERS=on`, a buddy on client 0.16.0 or later gets a
-chunked backup instead of one encrypted copy per file: a restic-format
+Since 0.19.0, a buddy on client 0.16.0 or later gets a chunked backup
+instead of one encrypted copy per file: a restic-format
 repository (built with rustic_core) under `<your node id>/.repo/` in their
 buddy files. Files are split into chunks by their content, so:
 
@@ -790,11 +790,20 @@ permanently" isn't offered: a file can't be cut out of existing
 snapshots, so its copies go when those snapshots age out. "What your
 buddy sees" shows the pack files as they sit on the buddy's disk.
 
-Buddies on older clients keep getting whole files. Not done yet: moving
-an existing whole-file backup over (turning this on uploads everything
-once more, the whole-file copies stay on the buddy for now, and Browse
-files shows only the chunked backup). Leave it off unless you're
-testing.
+Buddies on older clients keep getting whole files. Switching an existing
+whole-file backup over uploads everything once more, into the new format.
+Once that first snapshot is saved (and every file in your backup folder
+could be read), the whole-file copies on the buddy are deleted there, so
+they stay as backup copies for 30 days, like anything else you delete;
+Activity says when.
+
+A backup's threads run on at most 4 CPUs, since rustic_core sizes its
+thread pools to the CPUs it can see (a backup peaked at ~560 MB on 16
+CPUs and ~250 MB on 2 in testing).
+
+`CHUNKED_TRANSFERS=off` goes back to whole files: everything is sent as
+whole files again, and Browse files shows those. The chunked backup stays
+on the buddy, unused, until you turn it back on.
 
 ## Commands and settings
 
@@ -860,7 +869,7 @@ explanations.
 | `STALE_AFTER_SECS` | `600`, or 3× the scan interval if longer | How long without a successful cycle before the dashboard calls a buddy stale |
 | `DEFAULT_EXCLUDES` | on | `off` (or `false`, `0`, `no`) stops skipping the built-in list of poor fits (PST, live databases, VM disks, temp files). See "Excluding files" |
 | `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder sync as "everything deleted". Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
-| `CHUNKED_TRANSFERS` | off | **Testing only for now.** `on` (or `true`, `1`, `yes`) backs up to buddies on 0.16.0+ in chunks, so renames and moves cost nothing and edits send only what changed. Turning it on uploads everything once more (the whole-file copies already there stay, and Browse files then shows only the chunked backup). See "Chunked backups" |
+| `CHUNKED_TRANSFERS` | on | Backs up to buddies on 0.16.0+ in chunks, so renames and moves cost nothing and edits send only what changed. `off` (or `false`, `0`, `no`) sends whole files instead. See "Chunked backups" |
 | `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every hour). `off` disables the check |
 
 **Set by the image or compose file; don't set these yourself**

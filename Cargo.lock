@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "backup-buddies-client"
-version = "0.18.1"
+version = "0.19.0"
 dependencies = [
  "aes-siv",
  "age",
@@ -332,6 +332,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-mdns-address-lookup",
+ "libc",
  "n0-future",
  "reqwest",
  "rusqlite",

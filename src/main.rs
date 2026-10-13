@@ -590,8 +590,8 @@ async fn main() -> Result<()> {
     receive::clear_incoming(&config.buddy_files_dir).await;
     backup::init_spool(&config.data_dir).await;
     chunked::init(&config.data_dir);
-    if chunked::enabled() {
-        tracing::info!("CHUNKED_TRANSFERS is on: buddies on client 0.16.0+ get chunked backups (restores from them aren't in the dashboard yet)");
+    if !chunked::enabled() {
+        tracing::info!("CHUNKED_TRANSFERS is off: every buddy gets whole files");
     }
     excludes::init(&config.data_dir).await;
 
