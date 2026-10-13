@@ -1474,11 +1474,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="buddy-view">
       <p id="buddy-view-intro"></p>
-      <p>
-        They can see how many files you back up, each one's size, how folders nest and how many entries
-        each holds, and when things change. They can't see any file or folder name, or anything inside a file.
-        Click a file to see the first bytes of it exactly as it's stored on their disk.
-      </p>
+      <p id="buddy-view-explain"></p>
       <div class="stored-list" id="stored-list"></div>
       <pre id="stored-bytes">Pick a file above.</pre>
     </div>
@@ -1892,6 +1888,16 @@ function renderBuddyView() {
     .slice().sort((a, b) => a.remote.localeCompare(b.remote));
   const total = live.reduce((sum, f) => sum + f.size, 0);
   const noun = browseState.stored ? "encrypted pack file" : "file";
+  // What a buddy can and can't learn differs: whole files (one stored
+  // file per file, names encrypted) give away the shape of your folders;
+  // a chunked backup's packs give away only their own sizes.
+  document.getElementById("buddy-view-explain").textContent = browseState.stored
+    ? "They can see how many pack files there are, how big each one is, and when they change. They can't see " +
+      "how many files you back up, their names or sizes, your folders, or anything inside a file. Click a " +
+      "pack to see its first bytes exactly as it's stored on their disk."
+    : "They can see how many files you back up, each one's size, how folders nest and how many entries " +
+      "each holds, and when things change. They can't see any file or folder name, or anything inside a file. " +
+      "Click a file to see the first bytes of it exactly as it's stored on their disk.";
   buddyViewIntro.textContent = live.length
     ? browseState.label + " holds " + live.length + " " + noun + (live.length === 1 ? "" : "s") +
       " of yours, " + fmtBytes(total) + " in all. Here's the list as it sits on their disk." +
