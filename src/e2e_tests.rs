@@ -637,3 +637,130 @@ async fn e2e_repo_files() {
     conn.close(0u32.into(), b"done");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Chunked backups end to end against a real buddy: a snapshot of the
+/// backup folder lands in the buddy's repository; renames and moves send
+/// next to nothing; a 1-byte edit in a big file sends about one chunk; the
+/// data reads back through rustic with the passphrase-derived key; and a
+/// full pledge refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_chunked_backup() {
+    let root = std::env::temp_dir().join(format!("bb-e2e-chunked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (mine, config_a) = (root.join("a/my-files"), root.join("a/config"));
+    let (config_b, buddy_files_b) = (root.join("b/config"), root.join("b/buddy-files"));
+    for d in [&mine, &config_a, &config_b, &buddy_files_b] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    crate::crypto::init(&SecretString::from(PASS.to_string()), crate::crypto::tests::TEST_ACCOUNT).unwrap();
+    crate::chunked::init(&config_a);
+    let relay: RelayUrl = "https://relay.invalid".parse().unwrap();
+    let lookup_a = MemoryLookup::new();
+    let ep_b = endpoint(vec![protocol::ALPN.to_vec()], MemoryLookup::new()).await;
+    let ep_a = endpoint(vec![protocol::ALPN.to_vec()], lookup_a.clone()).await;
+    lookup_a.add_endpoint_info(ep_b.addr());
+    let (a_id, b_id) = (ep_a.id().to_string(), ep_b.id());
+    let pledge: PledgeBook = Arc::new(Mutex::new(HashMap::from([(
+        a_id.clone(),
+        PledgeState { pledged_bytes: 1 << 40, received_bytes: 0, account_id: None },
+    )])));
+    serve(ep_b.clone(), config_b.clone(), buddy_files_b.clone(), pledge.clone());
+
+    // Incompressible content, so sizes are meaningful.
+    let noise = |n: usize, seed: u64| -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    };
+    let big = noise(32_000_000, 1);
+    write(&mine, "videos/clip.bin", &big);
+    for i in 0..20 {
+        write(&mine, &format!("photos/2024/img{i:02}.jpg"), &noise(50_000, 100 + i));
+    }
+    let cycle = || crate::chunked::run_chunked_cycle(&ep_a, &relay, &mine, b_id, None);
+
+    // 1. First backup: everything goes, into the repository only.
+    let s = cycle().await.unwrap();
+    assert_eq!(s.files_sent, 21);
+    assert!(s.bytes_sent > 32_500_000, "sent {}", s.bytes_sent);
+    let sender_dir = buddy_files_b.join(&a_id);
+    assert!(crate::receive::list_sender_files(&sender_dir).await.is_empty(), "no whole files");
+    assert!(crate::repo::repo_size(&sender_dir).await > 32_500_000);
+
+    // 2. Nothing changed, but retention is due right after the first
+    // snapshot: it runs (prune finds nothing), sending no files.
+    let s = cycle().await.unwrap();
+    assert_eq!((s.files_sent, s.files_deleted), (0, 0));
+    assert!(s.traffic.is_some(), "connected for retention");
+    // 3. Still nothing changed and retention is done: fully idle.
+    let s = cycle().await.unwrap();
+    assert!(s.traffic.is_none(), "idle cycles don't connect");
+
+    // 4. Rename the big file and move the photos: next to nothing is sent.
+    std::fs::rename(mine.join("videos/clip.bin"), mine.join("videos/renamed.bin")).unwrap();
+    std::fs::rename(mine.join("photos/2024"), mine.join("photos/holiday")).unwrap();
+    let s = cycle().await.unwrap();
+    assert_eq!((s.files_sent, s.files_deleted), (21, 21), "21 new paths, 21 gone");
+    assert!(s.bytes_sent < 200_000, "a rename sent {} bytes", s.bytes_sent);
+    eprintln!("chunked: renaming 32 MB + moving 20 photos sent {} bytes", s.bytes_sent);
+
+    // 5. One byte changed in the middle of 32 MB: one chunk, which is
+    // 0.5–8 MB depending on where this repository's chunker (it picks its
+    // own random polynomial) happens to cut.
+    let mut edited = big.clone();
+    edited[16_000_000] ^= 0xff;
+    write(&mine, "videos/renamed.bin", &edited);
+    let s = cycle().await.unwrap();
+    assert_eq!(s.files_sent, 1);
+    assert!(s.bytes_sent < 9_000_000, "a 1-byte edit sent {} bytes", s.bytes_sent);
+    eprintln!("chunked: a 1-byte edit in 32 MB sent {} bytes", s.bytes_sent);
+
+    // The latest snapshot reads back through rustic, over the wire, with
+    // the key derived from the passphrase.
+    let backend = Arc::new(crate::repo_backend::BuddyBackend::new(ep_a.clone(), relay.clone(), b_id, None));
+    let target = mine.join("videos/renamed.bin");
+    let restored = tokio::task::spawn_blocking(move || {
+        use rustic_core::{Credentials, LsOptions, Repository, RepositoryBackends, RepositoryOptions};
+        let backends = RepositoryBackends::new(backend, None);
+        let key: rustic_core::repofile::MasterKey = serde_json::from_value({
+            use base64::Engine as _;
+            let k = crate::crypto::repo_key();
+            let b = |s: &[u8]| base64::engine::general_purpose::STANDARD.encode(s);
+            serde_json::json!({"encrypt": b(&k[..32]), "mac": {"k": b(&k[32..48]), "r": b(&k[48..])}})
+        })
+        .unwrap();
+        let repo = Repository::new(&RepositoryOptions::default().no_cache(true), &backends)
+            .unwrap()
+            .open(&Credentials::Masterkey(key))
+            .unwrap()
+            .to_indexed()
+            .unwrap();
+        let node = repo.node_from_snapshot_path("latest", |_| true).unwrap();
+        let (_, file) = repo
+            .ls(&node, &LsOptions::default())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|(path, _)| Path::new("/").join(path) == target)
+            .expect("the edited file is in the latest snapshot");
+        let open = repo.open_file(&file).unwrap();
+        repo.read_file_at(&open, 0, file.meta.size as usize).unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(restored.as_ref() == edited.as_slice(), "restored bytes match the edited file");
+
+    // 6. A buddy whose pledge is full refuses the next pack, and the cycle
+    // says so in the same words a whole-file refusal uses.
+    pledge.lock().unwrap().get_mut(&a_id).unwrap().pledged_bytes = 1;
+    write(&mine, "new.bin", &noise(2_000_000, 7));
+    let err = cycle().await.unwrap_err();
+    assert!(err.to_string().contains("pledge"), "got: {err:#}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

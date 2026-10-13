@@ -11,6 +11,8 @@ mod netinfo;
 mod protocol;
 mod receive;
 mod repo;
+mod repo_backend;
+mod chunked;
 mod crypto;
 #[cfg(test)]
 mod e2e_tests;
@@ -577,6 +579,10 @@ async fn main() -> Result<()> {
     );
     receive::clear_incoming(&config.buddy_files_dir).await;
     backup::init_spool(&config.data_dir).await;
+    chunked::init(&config.data_dir);
+    if chunked::enabled() {
+        tracing::info!("CHUNKED_TRANSFERS is on: buddies on client 0.16.0+ get chunked backups (restores from them aren't in the dashboard yet)");
+    }
     excludes::init(&config.data_dir).await;
 
     // Remove buddies' backup copies (replaced or deleted content) once
@@ -998,7 +1004,7 @@ async fn main() -> Result<()> {
                             activity::set_label(node_id_str, &label);
 
                             if let Some(backup_dir) = &config.backup_dir {
-                                let result = backup::run_backup_cycle(
+                                let result = chunked::run_backup_cycle(
                                     &endpoint,
                                     &config.relay_url,
                                     backup_dir,

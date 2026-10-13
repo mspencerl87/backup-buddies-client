@@ -1,6 +1,6 @@
 [package]
 name = "backup-buddies-client"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 license = "GPL-3.0-only"
 authors = ["Spencer LeBlanc"]
@@ -57,3 +57,15 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 walkdir = "2.5.0"
+# Chunked backups (src/chunked.rs): a restic-format repository on the
+# buddy, so a rename costs nothing and an edit only the chunks it touched.
+# Pinned exactly: rustic_core is 0.x and its API moves between releases.
+# Picked over our own fastcdc chunk store after a spike (2026-10-13): it
+# already does packing, the index, snapshots and safe prune.
+rustic_core = "=0.13.0"
+# rustic_core's buffer type, for its storage-backend trait (repo_backend.rs).
+# Already in the tree through iroh; same version.
+bytes = "1.12"
+# The chunked-backup master key is handed to rustic_core in its serialized
+# (base64) form (chunked.rs). Already in the tree; same version.
+base64 = "0.22"

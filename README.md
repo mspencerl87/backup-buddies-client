@@ -760,6 +760,34 @@ a monthly relay allowance instead (shown on the billing card); past it,
 buddy syncing pauses until the 1st of the next month, or until the
 account subscribes.
 
+## Chunked backups (testing)
+
+With `CHUNKED_TRANSFERS=on`, a buddy on client 0.16.0 or later gets a
+chunked backup instead of one encrypted copy per file: a restic-format
+repository (built with rustic_core) under `<your node id>/.repo/` in their
+buddy files. Files are split into chunks by their content, so:
+
+- renaming or moving a file or folder sends next to nothing (in testing,
+  renaming a 1 GB file and moving 300 photos stored 0 bytes);
+- editing part of a big file sends only the chunks it touched (1 MB
+  changed in the middle of a 1 GB file: about 1–6 MB);
+- identical content is stored once, wherever it appears.
+
+Each cycle that finds a change saves a snapshot. Snapshots are kept every
+one for 24 hours, then one per hour up to 2 days, then one per day up to
+30 days; once a day older ones are forgotten and their space freed. The
+buddy sees only encrypted pack files (how big they are and when they
+change), not your file names, how many files you have, their sizes or
+your folders. The repository's key comes from
+your passphrase, like the file key, so the passphrase alone still
+restores everything.
+
+Buddies on older clients keep getting whole files. Not done yet: restoring
+and browsing a chunked backup from the dashboard, and moving an existing
+whole-file backup over (turning this on uploads everything once more,
+and the whole-file copies stay on the buddy for now). Leave it off unless
+you're testing.
+
 ## Commands and settings
 
 Everything you can run or set, in one place. The sections above explain
@@ -824,6 +852,7 @@ explanations.
 | `STALE_AFTER_SECS` | `600`, or 3× the scan interval if longer | How long without a successful cycle before the dashboard calls a buddy stale |
 | `DEFAULT_EXCLUDES` | on | `off` (or `false`, `0`, `no`) stops skipping the built-in list of poor fits (PST, live databases, VM disks, temp files). See "Excluding files" |
 | `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder sync as "everything deleted". Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
+| `CHUNKED_TRANSFERS` | off | **Testing only for now.** `on` (or `true`, `1`, `yes`) backs up to buddies on 0.16.0+ in chunks, so renames and moves cost nothing and edits send only what changed. Restoring from a chunked backup isn't in the dashboard yet, and turning it on uploads everything once more (the whole-file copies already there stay). See "Chunked backups" |
 | `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every hour). `off` disables the check |
 
 **Set by the image or compose file; don't set these yourself**

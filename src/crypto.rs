@@ -58,6 +58,8 @@ pub struct Keys {
     legacy: age::scrypt::Identity,
     /// AES-SIV key for file and folder names (see names.rs).
     name_key: [u8; 64],
+    /// Master key of the chunked-backup repository (see chunked.rs).
+    repo_key: [u8; 64],
 }
 
 static KEYS: OnceLock<Keys> = OnceLock::new();
@@ -73,12 +75,13 @@ pub fn init(passphrase: &SecretString, account_id: &str) -> Result<()> {
     let mut secret = derive_secret(passphrase, salt.as_bytes());
     let identity = identity_from_secret(&secret);
     let name_key = name_key_from_secret(&secret);
+    let repo_key = labelled_key(REPO_KEY_LABEL, &secret);
     secret.fill(0);
     let identity = identity?;
     let recipient = identity.to_public();
     let v1 = LazyIdentity { passphrase: passphrase.clone(), key: OnceLock::new() };
     let legacy = age::scrypt::Identity::new(passphrase.clone());
-    let _ = KEYS.set(Keys { recipient, identity, v1, legacy, name_key });
+    let _ = KEYS.set(Keys { recipient, identity, v1, legacy, name_key, repo_key });
     Ok(())
 }
 
@@ -118,9 +121,20 @@ const NAME_KEY_LABEL: &[u8] = b"backup-buddies/name-key/v1\0";
 /// already a uniformly random key, so one SHA-512 is a sound derivation
 /// (HKDF's extract step adds nothing here) and gives AES-SIV its 64 bytes.
 fn name_key_from_secret(secret: &[u8; 32]) -> [u8; 64] {
+    labelled_key(NAME_KEY_LABEL, secret)
+}
+
+/// Domain-separates the chunked-backup repository's master key. Like the
+/// name key, changing it (or the scrypt salt) orphans every repository
+/// already on a buddy.
+const REPO_KEY_LABEL: &[u8] = b"backup-buddies/repo-key/v1\0";
+
+/// 64 bytes for `label` from the scrypt output (see name_key_from_secret
+/// for why one SHA-512 is enough).
+fn labelled_key(label: &[u8], secret: &[u8; 32]) -> [u8; 64] {
     use sha2::{Digest, Sha512};
     let mut hasher = Sha512::new();
-    hasher.update(NAME_KEY_LABEL);
+    hasher.update(label);
     hasher.update(secret);
     let mut key = [0u8; 64];
     key.copy_from_slice(&hasher.finalize());
@@ -160,6 +174,14 @@ pub fn keys() -> &'static Keys {
 /// The AES-SIV key names.rs encrypts file and folder names with.
 pub(crate) fn name_key() -> &'static [u8; 64] {
     &keys().name_key
+}
+
+/// The chunked-backup repository's master key: AES-256 key, then the
+/// Poly1305-AES k and r, in the layout rustic_core's MasterKey takes. Built
+/// from the passphrase, so no restic key file is ever written (or needed
+/// on a rebuilt device).
+pub(crate) fn repo_key() -> &'static [u8; 64] {
+    &keys().repo_key
 }
 
 /// Exact encrypted size of a file, given the length of its age header +
@@ -418,6 +440,8 @@ pub(crate) mod tests {
         assert!(!name_key().windows(32).any(|w| w == secret), "the age key's bytes aren't reused");
         let other = derive_secret(&pass, format!("{KDF_SALT_PREFIX}00000000-0000-4000-8000-000000000002").as_bytes());
         assert_ne!(&name_key_from_secret(&other), name_key(), "another account, other names");
+        assert_eq!(&labelled_key(REPO_KEY_LABEL, &secret), repo_key(), "repo key re-derivable too");
+        assert_ne!(repo_key(), name_key(), "and not the name key");
     }
 
     #[tokio::test(flavor = "multi_thread")]

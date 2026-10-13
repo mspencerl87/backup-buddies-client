@@ -136,15 +136,15 @@ pub type CycleProgressBook = Arc<Mutex<HashMap<String, CycleProgress>>>;
 
 /// Updates one buddy's entry in a `CycleProgressBook`, and removes it when
 /// dropped, so an early return or error never leaves a stuck progress bar.
-struct ProgressTracker {
+pub(crate) struct ProgressTracker {
     book: Option<CycleProgressBook>,
     node_id: String,
-    counter: Arc<AtomicU64>,
+    pub(crate) counter: Arc<AtomicU64>,
     skipped: Arc<AtomicU64>,
 }
 
 impl ProgressTracker {
-    fn new(book: Option<&CycleProgressBook>, node_id: &str) -> Self {
+    pub(crate) fn new(book: Option<&CycleProgressBook>, node_id: &str) -> Self {
         let counter = Arc::new(AtomicU64::new(0));
         let skipped = Arc::new(AtomicU64::new(0));
         if let Some(book) = book {
@@ -162,7 +162,7 @@ impl ProgressTracker {
         Self { book: book.cloned(), node_id: node_id.to_string(), counter, skipped }
     }
 
-    fn update(&self, f: impl FnOnce(&mut CycleProgress)) {
+    pub(crate) fn update(&self, f: impl FnOnce(&mut CycleProgress)) {
         if let Some(book) = &self.book
             && let Some(p) = book.lock().unwrap().get_mut(&self.node_id)
         {
@@ -171,7 +171,7 @@ impl ProgressTracker {
     }
 
     /// Starts tracking a new current file (resets the byte counter).
-    fn start_file(&self, path: &str, size: u64) {
+    pub(crate) fn start_file(&self, path: &str, size: u64) {
         self.counter.store(0, Ordering::Relaxed);
         self.update(|p| {
             p.current_path = Some(path.to_string());
@@ -1175,11 +1175,11 @@ pub async fn local_backup_summary(backup_dir: &Path) -> Result<(usize, u64, usiz
 /// One file found in BACKUP_DIR. `mtime_ns` is its modified time in
 /// nanoseconds since the epoch (-1 if unavailable, which never matches a
 /// cached entry, so the file is simply re-hashed).
-struct LocalFile {
-    rel_path: String,
+pub(crate) struct LocalFile {
+    pub(crate) rel_path: String,
     abs_path: PathBuf,
-    size: u64,
-    mtime_ns: i64,
+    pub(crate) size: u64,
+    pub(crate) mtime_ns: i64,
 }
 
 /// A file going to a buddy this cycle.
@@ -1202,15 +1202,15 @@ struct Upload {
 /// deleted, so callers must not treat "not in `files`" as "gone" while
 /// `unreadable` is non-empty. Excluded files are left out of `files`, so
 /// one that was backed up before is mirrored as deleted.
-struct LocalScan {
-    files: Vec<LocalFile>,
-    unreadable: Vec<String>,
+pub(crate) struct LocalScan {
+    pub(crate) files: Vec<LocalFile>,
+    pub(crate) unreadable: Vec<String>,
     /// Files and skipped folders the exclude list kept out.
-    excluded: usize,
-    rules: crate::excludes::Rules,
+    pub(crate) excluded: usize,
+    pub(crate) rules: crate::excludes::Rules,
 }
 
-fn rel_to(backup_dir: &Path, abs_path: &Path) -> String {
+pub(crate) fn rel_to(backup_dir: &Path, abs_path: &Path) -> String {
     abs_path
         .strip_prefix(backup_dir)
         .unwrap_or(abs_path)
@@ -1221,7 +1221,7 @@ fn rel_to(backup_dir: &Path, abs_path: &Path) -> String {
 // Metadata only — no file contents are read here. Runs on a blocking
 // thread, since walking a large folder can take a while. The exclude list
 // is re-read each time, so edits apply on the next cycle.
-async fn scan_local_files(backup_dir: &Path) -> Result<LocalScan> {
+pub(crate) async fn scan_local_files(backup_dir: &Path) -> Result<LocalScan> {
     let backup_dir = backup_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let rules = crate::excludes::Rules::load()?;
@@ -1287,7 +1287,7 @@ fn scan_local_files_blocking(backup_dir: &Path, rules: crate::excludes::Rules) -
 /// True when BACKUP_DIR scanned completely (nothing unreadable) yet came
 /// back empty while the buddy holds files from it — the signature of a
 /// drive that isn't mounted rather than a real "delete everything".
-fn looks_like_missing_drive(local_files: usize, unreadable: usize, backed_up: usize) -> bool {
+pub(crate) fn looks_like_missing_drive(local_files: usize, unreadable: usize, backed_up: usize) -> bool {
     local_files == 0 && unreadable == 0 && backed_up > 0
 }
 

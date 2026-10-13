@@ -291,14 +291,9 @@ pub(crate) async fn handle_remove(
     Ok(())
 }
 
-// ---- The sender's side ----
-//
-// Buddies take repository files from client 0.16.0 on, ahead of senders
-// using them: the rustic backend that calls these comes next (only the
-// e2e test calls them so far).
+// ---- The sender's side (called by repo_backend.rs) ----
 
 /// Lists one kind of file in our repository on the buddy.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn list(conn: &iroh::endpoint::Connection, kind: RepoFileKind) -> Result<Vec<RepoFileEntry>> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(&mut send, &SyncRequest::RepoList { kind }).await?;
@@ -314,7 +309,6 @@ pub(crate) async fn list(conn: &iroh::endpoint::Connection, kind: RepoFileKind) 
 }
 
 /// Reads part of a repository file (the rest of it when `length` is None).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn read(
     conn: &iroh::endpoint::Connection,
     kind: RepoFileKind,
@@ -339,7 +333,6 @@ pub(crate) async fn read(
 
 /// Stores a repository file. A refusal (pledge or disk full) fails with the
 /// same STOP_SENDING reason a whole-file upload gets.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn write(conn: &iroh::endpoint::Connection, kind: RepoFileKind, id: &str, data: &[u8]) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(&mut send, &SyncRequest::RepoWrite { kind, id: id.to_string(), len: data.len() as u64 })
@@ -356,7 +349,6 @@ pub(crate) async fn write(conn: &iroh::endpoint::Connection, kind: RepoFileKind,
 }
 
 /// Removes a repository file (fine if it's already gone).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn remove(conn: &iroh::endpoint::Connection, kind: RepoFileKind, id: &str) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(&mut send, &SyncRequest::RepoRemove { kind, id: id.to_string() }).await?;
