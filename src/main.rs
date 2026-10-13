@@ -951,6 +951,7 @@ async fn main() -> Result<()> {
                 tracing::warn!("relay still not connected after 15s — starting backups anyway (direct connections only until it is)");
             }
 
+            let mut last_orphan_sweep: Option<std::time::Instant> = None;
             loop {
                 match fetch_buddy_devices(&http, &config, &bandwidth_book).await {
                     Ok((true, _buddies, label)) => {
@@ -995,6 +996,36 @@ async fn main() -> Result<()> {
                                     .and_then(|s| s.parse::<u64>().ok())
                                     .unwrap_or(0);
                                 entry.account_id = Some(buddy.account_id.clone());
+                            }
+                        }
+                        // Once a day, against this successful poll: files
+                        // kept for a device that's no longer any buddy's
+                        // (a new node id, an ended pairing) are marked, and
+                        // removed 30 days on (receive::sweep_orphans).
+                        if last_orphan_sweep.is_none_or(|at: std::time::Instant| at.elapsed() >= Duration::from_secs(24 * 60 * 60)) {
+                            last_orphan_sweep = Some(std::time::Instant::now());
+                            let current: std::collections::HashSet<String> =
+                                buddies.iter().filter_map(|b| b.iroh_node_id.clone()).collect();
+                            let removed = receive::sweep_orphans(
+                                &config.data_dir,
+                                &config.buddy_files_dir,
+                                &current,
+                                dashboard::unix_now(),
+                            )
+                            .await;
+                            for (node_id, bytes) in &removed {
+                                tracing::info!(
+                                    node_id = %node_id,
+                                    bytes,
+                                    days = receive::ORPHAN_KEEP_DAYS,
+                                    "removed what a former buddy device kept here"
+                                );
+                                pledge_book.lock().unwrap().remove(node_id);
+                            }
+                            if !removed.is_empty()
+                                && let Err(err) = receive::save_usage_ledger(&config.data_dir, &pledge_book).await
+                            {
+                                tracing::warn!(?err, "failed to persist usage ledger after removing a former device's files");
                             }
                         }
                         for buddy in buddies {

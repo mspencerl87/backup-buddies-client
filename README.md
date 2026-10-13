@@ -471,6 +471,12 @@ Buddy files (`BUDDY_FILES_DIR`):
   counts against that buddy's pledge in full. Don't edit or delete
   anything in it by hand; a missing pack loses whatever was in it.
 
+A folder whose node id isn't one of your buddies' devices any more (their
+client got a new identity, or the pairing ended) is removed 30 days after
+this device first notices, unless that device comes back. Its card on the
+dashboard says when. The dates are kept in `orphans.json` in the config
+folder.
+
 Restores (`RESTORE_DIR`): `<buddy node id>/...` — only appears after a
 restore.
 

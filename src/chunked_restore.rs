@@ -26,7 +26,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rustic_core::repofile::{Node, SnapshotFile};
-use rustic_core::{Credentials, IndexedFullStatus, LsOptions, ReadBackend, Repository, RepositoryBackends, TreeId};
+use rustic_core::{
+    Credentials, IndexedFullStatus, IndexedTree, LsOptions, ReadBackend, Repository, RepositoryBackends, TreeId,
+};
 
 use crate::netinfo;
 use crate::protocol::{self, VersionEntry};
@@ -103,14 +105,14 @@ fn files_in(repo: &Repo, snap: &SnapshotFile) -> Result<HashMap<String, Node>> {
 }
 
 /// The tree of the backup folder in a snapshot.
-fn root_tree(repo: &Repo, snap: &SnapshotFile) -> Option<TreeId> {
+pub(crate) fn root_tree<S: IndexedTree>(repo: &Repository<S>, snap: &SnapshotFile) -> Option<TreeId> {
     repo.node_from_snapshot_path(&format!("{}:{}", snap.id, root_of(snap)), |_| true).ok()?.subtree
 }
 
 /// Adds every file under `old` that isn't under `new` (by the same path) to
 /// `out`, with its size. Folders whose trees are identical are skipped.
-fn missing_from(
-    repo: &Repo,
+pub(crate) fn missing_from<S: IndexedTree>(
+    repo: &Repository<S>,
     old: TreeId,
     new: Option<TreeId>,
     prefix: &str,
@@ -138,6 +140,47 @@ fn missing_from(
             }
         } else if node.is_file() && !counterpart.is_some_and(Node::is_file) {
             out.entry(path).or_insert(node.meta.size);
+        }
+    }
+    Ok(())
+}
+
+/// Adds every file under `new` that's missing under `old` or has
+/// different contents there, up to `cap` of them; for the Activity line of
+/// a chunked backup. Folders whose trees are identical are skipped.
+pub(crate) fn changed_in<S: IndexedTree>(
+    repo: &Repository<S>,
+    old: Option<TreeId>,
+    new: TreeId,
+    prefix: &str,
+    out: &mut Vec<String>,
+    cap: usize,
+) -> Result<()> {
+    if Some(new) == old || out.len() >= cap {
+        return Ok(());
+    }
+    let old_nodes: HashMap<_, Node> = match old {
+        Some(id) => repo.get_tree(&id)?.nodes.into_iter().map(|n| (n.name().into_owned(), n)).collect(),
+        None => HashMap::new(),
+    };
+    for node in repo.get_tree(&new)?.nodes {
+        if out.len() >= cap {
+            break;
+        }
+        let name = node.name().into_owned();
+        let path = if prefix.is_empty() {
+            name.to_string_lossy().into_owned()
+        } else {
+            format!("{prefix}/{}", name.to_string_lossy())
+        };
+        let counterpart = old_nodes.get(&name);
+        if node.is_dir() {
+            if let Some(subtree) = node.subtree {
+                let old_sub = counterpart.filter(|n| n.is_dir()).and_then(|n| n.subtree);
+                changed_in(repo, old_sub, subtree, &path, out, cap)?;
+            }
+        } else if node.is_file() && counterpart.filter(|n| n.is_file()).map(|n| &n.content) != Some(&node.content) {
+            out.push(path);
         }
     }
     Ok(())

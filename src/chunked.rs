@@ -312,6 +312,8 @@ pub(crate) async fn run_chunked_cycle(
         stats.files_sent = (new + changed) as usize;
         stats.files_deleted = state.files.saturating_sub(changed + unmodified) as usize;
         stats.bytes_sent = s.map(|s| s.data_added_packed).unwrap_or(0);
+        stats.sent_paths = outcome.sent_paths.clone();
+        stats.deleted_paths = outcome.deleted_paths.clone();
         state.files = total;
         state.bytes = s.map(|s| s.total_bytes_processed).unwrap_or(0);
         state.fingerprint = fp;
@@ -470,6 +472,38 @@ impl Drop for CpuCap {
 struct Outcome {
     snapshot: Option<SnapshotFile>,
     retention_ran: bool,
+    /// What the new snapshot added or changed, and dropped, against its
+    /// parent, for the Activity line (capped like whole-file backups').
+    sent_paths: Vec<String>,
+    deleted_paths: Vec<String>,
+}
+
+/// Most paths listed per Activity line (same as whole-file backups).
+const ACTIVITY_PATHS: usize = 200;
+
+/// Which files the new snapshot added or changed, and which it no longer
+/// has, compared with its parent. Only for Activity, so a failure just
+/// leaves the lists empty.
+fn snapshot_changes<S: rustic_core::IndexedTree>(
+    repo: &Repository<S>,
+    snap: &SnapshotFile,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let Some(new_root) = crate::chunked_restore::root_tree(repo, snap) else { return Ok(Default::default()) };
+    let parent = match snap.parent {
+        Some(id) => repo.get_all_snapshots()?.into_iter().find(|s| s.id == id),
+        None => None,
+    };
+    let old_root = parent.as_ref().and_then(|p| crate::chunked_restore::root_tree(repo, p));
+    let mut sent = Vec::new();
+    crate::chunked_restore::changed_in(repo, old_root, new_root, "", &mut sent, ACTIVITY_PATHS)?;
+    let mut deleted = std::collections::HashMap::new();
+    if let Some(old_root) = old_root {
+        crate::chunked_restore::missing_from(repo, old_root, Some(new_root), "", &mut deleted)?;
+    }
+    let mut deleted: Vec<String> = deleted.into_keys().collect();
+    deleted.sort();
+    deleted.truncate(ACTIVITY_PATHS);
+    Ok((sent, deleted))
 }
 
 /// The rustic part of a cycle, on a blocking thread: open (or create) the
@@ -511,6 +545,21 @@ fn snapshot_and_tidy(
     } else {
         None
     };
+    // The index loaded above predates this snapshot's own trees, so the
+    // comparison reads a freshly loaded one (the new index files are
+    // small; the rest comes from the cache).
+    let (sent_paths, deleted_paths) = match &snapshot {
+        Some(snap) => Repository::new(&opts, &backends)
+            .and_then(|r| r.open(&creds))
+            .and_then(|r| r.to_indexed_ids())
+            .map_err(anyhow::Error::from)
+            .and_then(|fresh| snapshot_changes(&fresh, snap))
+            .unwrap_or_else(|err| {
+                tracing::debug!(?err, "couldn't list what this snapshot changed");
+                Default::default()
+            }),
+        None => Default::default(),
+    };
 
     let mut retention_ran = false;
     if retention_due {
@@ -530,7 +579,7 @@ fn snapshot_and_tidy(
         repo.prune(&prune_opts, plan)?;
         retention_ran = true;
     }
-    Ok(Outcome { snapshot, retention_ran })
+    Ok(Outcome { snapshot, retention_ran, sent_paths, deleted_paths })
 }
 
 /// Which snapshots the retention policy drops: every one from the last 24

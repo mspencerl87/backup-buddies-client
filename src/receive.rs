@@ -245,6 +245,75 @@ pub async fn expire_versions(buddy_files_dir: &Path) -> (usize, u64) {
     .unwrap_or_default()
 }
 
+/// A folder in BUDDY_FILES_DIR whose node id isn't one of our buddies'
+/// devices any more is removed this long after it was first noticed.
+/// Seen on a test device (2026-10-13): a buddy's client got a new node id
+/// (moved to another machine with the same token), and what the old id
+/// stored stayed here for good, counted against our disk, as a nameless
+/// buddy card. An ended pairing leaves the same behind.
+pub const ORPHAN_KEEP_DAYS: u64 = 30;
+
+/// When each such folder was first noticed: DATA_DIR/orphans.json,
+/// `{ "<node id>": <unix seconds> }`. Kept out of BUDDY_FILES_DIR so
+/// nothing new shows up in anyone's listing.
+fn orphans_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("orphans.json")
+}
+
+pub fn load_orphans(data_dir: &Path) -> HashMap<String, u64> {
+    std::fs::read(orphans_path(data_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Marks folders whose node id isn't in `current` (every device of every
+/// buddy, from a successful poll), unmarks ones whose device is back, and
+/// removes those marked ORPHAN_KEEP_DAYS ago. Returns what was removed
+/// (node id, bytes), so the caller can free it from the pledge book.
+pub async fn sweep_orphans(
+    data_dir: &Path,
+    buddy_files_dir: &Path,
+    current: &std::collections::HashSet<String>,
+    now_unix: u64,
+) -> Vec<(String, u64)> {
+    let mut marks = load_orphans(data_dir);
+    let mut removed = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let Ok(mut entries) = tokio::fs::read_dir(buddy_files_dir).await else { return removed };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        seen.insert(name.clone());
+        if current.contains(&name) {
+            marks.remove(&name);
+            continue;
+        }
+        let since = *marks.entry(name.clone()).or_insert(now_unix);
+        if now_unix.saturating_sub(since) >= ORPHAN_KEEP_DAYS * 24 * 60 * 60 {
+            let bytes = walkdir::WalkDir::new(entry.path())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum();
+            match tokio::fs::remove_dir_all(entry.path()).await {
+                Ok(()) => {
+                    marks.remove(&name);
+                    removed.push((name, bytes));
+                }
+                Err(err) => tracing::warn!(node_id = %name, ?err, "couldn't remove a former buddy device's files"),
+            }
+        }
+    }
+    // Folders that went some other way (removed by hand) need no mark.
+    marks.retain(|name, _| seen.contains(name));
+    if let Ok(json) = serde_json::to_vec(&marks) {
+        let _ = tokio::fs::write(orphans_path(data_dir), json).await;
+    }
+    removed
+}
+
 // How much of a buddy's pledge we've used (received_bytes) against how
 // much they've actually pledged us (pledged_bytes). Keyed by the buddy's
 // Iroh node id (EndpointId's string form), but a pledge is between two
@@ -1472,6 +1541,36 @@ async fn handle_get_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn former_buddy_devices_are_removed_after_30_days_unless_they_return() {
+        let root = std::env::temp_dir().join(format!("bb-orphans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (data, files) = (root.join("config"), root.join("buddy-files"));
+        std::fs::create_dir_all(&data).unwrap();
+        for dir in ["paired", "gone", "back"] {
+            std::fs::create_dir_all(files.join(dir).join("n1")).unwrap();
+            std::fs::write(files.join(dir).join("n1/f"), b"12345").unwrap();
+        }
+        std::fs::write(files.join(".backup-buddies-id"), b"marker").unwrap();
+        let day = 24 * 60 * 60;
+        let paired: std::collections::HashSet<String> = ["paired".to_string()].into();
+
+        // First noticed: marked, nothing removed.
+        assert!(sweep_orphans(&data, &files, &paired, 1000 * day).await.is_empty());
+        assert_eq!(load_orphans(&data).keys().len(), 2);
+        // A device that comes back is unmarked.
+        let with_back: std::collections::HashSet<String> = ["paired".into(), "back".into()].into();
+        assert!(sweep_orphans(&data, &files, &with_back, 1010 * day).await.is_empty());
+        assert_eq!(load_orphans(&data).keys().collect::<Vec<_>>(), ["gone"]);
+        // 30 days after it was first noticed, the other one goes.
+        let removed = sweep_orphans(&data, &files, &with_back, 1030 * day).await;
+        assert_eq!(removed, [("gone".to_string(), 5)]);
+        assert!(!files.join("gone").exists() && files.join("paired").exists() && files.join("back").exists());
+        assert!(files.join(".backup-buddies-id").exists(), "the folder's own marker isn't a buddy");
+        assert!(load_orphans(&data).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn set_age_days(path: &Path, days: u64) {
         let t = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 60 * 60);

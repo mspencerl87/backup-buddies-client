@@ -230,6 +230,9 @@ struct BuddyStatus {
     sent_chunked: bool,
     // Size of the chunked backup they keep with us (0 if none).
     received_repo_bytes: u64,
+    // Set when this isn't one of our buddies' devices any more: when what
+    // it keeps here is removed (receive::sweep_orphans).
+    removal_due_unix: Option<u64>,
     last_cycle: Option<CycleRecord>,
     // Live progress of a backup cycle running right now, if one is — see
     // backup::CycleProgress. Absent between cycles.
@@ -629,6 +632,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             })
     };
 
+    let orphans = receive::load_orphans(&state.data_dir);
     let mut buddies = Vec::with_capacity(buddy_ids.len());
     for node_id in buddy_ids {
         let pledge = pledge_snapshot.get(&node_id).cloned().unwrap_or_default();
@@ -667,6 +671,8 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         });
 
         let in_progress = progress_snapshot.get(&node_id).cloned();
+        let removal_due_unix =
+            orphans.get(&node_id).map(|since| since + receive::ORPHAN_KEEP_DAYS * 24 * 60 * 60);
         buddies.push(BuddyStatus {
             label: cycle.as_ref().map(|c| c.label.clone()),
             node_id,
@@ -678,6 +684,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             sent_bytes,
             sent_chunked: chunked_sent.is_some(),
             received_repo_bytes,
+            removal_due_unix,
             in_progress,
             last_cycle: cycle,
             stale,
@@ -2543,6 +2550,7 @@ function renderBuddy(b) {
       <div>${cyclePill}${stalePill}</div>
     </div>
     ${progressBlock}
+    ${b.removal_due_unix ? `<div class="muted">Not one of your buddies' devices any more (a new device, or the pairing ended). What it keeps here is removed on ${escapeHtml(new Date(b.removal_due_unix * 1000).toLocaleDateString())}.</div>` : ""}
     <div class="muted">${cycleDetail}</div>
     ${failedLine}
     ${reconcileLine}

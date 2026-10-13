@@ -734,6 +734,11 @@ async fn e2e_chunked_backup() {
     assert_eq!((s.files_sent, s.files_deleted), (21, 21), "21 new paths, 21 gone");
     assert!(s.bytes_sent < 200_000, "a rename sent {} bytes", s.bytes_sent);
     eprintln!("chunked: renaming 32 MB + moving 20 photos sent {} bytes", s.bytes_sent);
+    // Activity lists the paths, from comparing the snapshot with its parent.
+    assert!(s.sent_paths.contains(&"videos/renamed.bin".to_string()), "{:?}", s.sent_paths);
+    assert!(s.sent_paths.contains(&"photos/holiday/img07.jpg".to_string()));
+    assert!(s.deleted_paths.contains(&"videos/clip.bin".to_string()), "{:?}", s.deleted_paths);
+    assert_eq!((s.sent_paths.len(), s.deleted_paths.len()), (21, 21));
 
     // 5. One byte changed in the middle of 32 MB: one chunk, which is
     // 0.5–8 MB depending on where this repository's chunker (it picks its
@@ -745,6 +750,8 @@ async fn e2e_chunked_backup() {
     assert_eq!(s.files_sent, 1);
     assert!(s.bytes_sent < 9_000_000, "a 1-byte edit sent {} bytes", s.bytes_sent);
     eprintln!("chunked: a 1-byte edit in 32 MB sent {} bytes", s.bytes_sent);
+    assert_eq!(s.sent_paths, ["videos/renamed.bin"]);
+    assert!(s.deleted_paths.is_empty());
 
     // The latest snapshot reads back through rustic, over the wire, with
     // the key derived from the passphrase.

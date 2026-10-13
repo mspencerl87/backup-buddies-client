@@ -64,7 +64,7 @@ pub fn parse_package_version(cargo_toml: &str) -> Option<String> {
 }
 
 fn version_parts(v: &str) -> Vec<u64> {
-    v.split(|c| c == '.' || c == '-')
+    v.split(['.', '-'])
         .take(3)
         .map(|n| n.parse().unwrap_or(0))
         .collect()
