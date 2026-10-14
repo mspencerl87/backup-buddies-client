@@ -894,45 +894,27 @@ async fn main() -> Result<()> {
                                             && stats.files_deleted == 0
                                             && stats.files_failed == 0 =>
                                     {
-                                        // Truly idle: run_backup_cycle found nothing new to
-                                        // send and, per its own doc comment, never opened a
-                                        // connection at all — so unlike the general "nothing
-                                        // sent" case below, reachability here has not actually
-                                        // been checked by anything yet. Piggyback the same
-                                        // lightweight Ping the no-BACKUP_DIR branch below already
-                                        // uses as its own connectivity check, so a dead buddy
-                                        // doesn't sit at "backup ok" forever just because there
-                                        // was nothing to resend.
-                                        let ping_result =
-                                            ping(&endpoint, &config.relay_url, buddy_id).await;
+                                        // Idle: nothing new to send. The cycle still connected
+                                        // and checked the buddy has the backup (see
+                                        // chunked::run_backup_cycle), so reachability is proven
+                                        // without a separate ping, and a dead buddy can't sit at
+                                        // "backup ok" just because there was nothing to send.
                                         dashboard::CycleRecord {
                                             label: label.clone(),
                                             at: dashboard::unix_now(),
                                             kind: "backup",
-                                            ok: ping_result.is_ok(),
-                                            detail: match &ping_result {
-                                                Ok(()) => {
-                                                    "nothing new to back up (connectivity check ok)"
-                                                        .to_string()
-                                                }
-                                                Err(err) => format!(
-                                                    "nothing new to back up, but connectivity \
-                                                     check failed: {err}"
-                                                ),
-                                            },
+                                            ok: true,
+                                            detail: "nothing new to back up (checked with buddy)".to_string(),
                                             files_sent: Some(0),
                                             files_deleted: Some(0),
                                             bytes_sent: None,
                                             duration_ms: None,
-                                            connection: None,
+                                            connection: stats.connection,
                                             files_failed: Some(0),
                                             failed_files: Vec::new(),
                                             last_ok_at: None,
                                             consecutive_failures: 0,
-                                            // This is now backed by a real Ping instead of an
-                                            // unconditional assumption — the actual reachability
-                                            // signal "stale" is meant to track.
-                                            made_progress: ping_result.is_ok(),
+                                            made_progress: true,
                                             last_synced_at: None,
                                         }
                                     }
@@ -1020,22 +1002,10 @@ async fn main() -> Result<()> {
                                         last_synced_at: None,
                                     },
                                 };
-                                // Log against `record` (not `result` directly) so the idle
-                                // case's log reflects the ping we just ran instead of
-                                // re-deriving a verdict without it.
                                 match &result {
                                     Ok(stats) if stats.files_sent == 0 && stats.files_deleted == 0 => {
-                                        if record.ok {
-                                            tracing::debug!(
-                                                buddy = %label,
-                                                "nothing new to back up (connectivity check ok)"
-                                            )
-                                        } else if stats.files_failed == 0 {
-                                            tracing::warn!(
-                                                buddy = %label,
-                                                detail = %record.detail,
-                                                "nothing new to back up, and connectivity check failed"
-                                            )
+                                        if stats.files_failed == 0 {
+                                            tracing::debug!(buddy = %label, "nothing new to back up (checked with buddy)")
                                         } else {
                                             tracing::warn!(
                                                 buddy = %label,

@@ -515,7 +515,10 @@ local network, about 21 GB over three long transfers ran clean.
 
 - **Change detection:** each cycle lists the folder (paths, sizes and
   modified times only) and compares a fingerprint of that with the last
-  snapshot's; when they match, nothing is read and no connection is made.
+  snapshot's; when they match, nothing is read. The cycle still connects
+  and checks the buddy lists the last snapshot saved there (that replaces
+  the old connectivity ping); if it doesn't, because the buddy lost or
+  deleted it, the next backup is a full one, and Activity says so.
   When they don't, rustic reads files whose size or modified time changed
   since the parent snapshot (inode and ctime are ignored, since they
   change across an SMB/NFS remount) and sends only new chunks.

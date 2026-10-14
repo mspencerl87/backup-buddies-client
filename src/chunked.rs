@@ -70,6 +70,10 @@ struct State {
     #[serde(default)]
     bytes: u64,
     last_retention_unix: u64,
+    /// Id of the last snapshot saved, checked against the buddy's list
+    /// every cycle (see run_backup_cycle). Empty in state from 0.21.0.
+    #[serde(default)]
+    snapshot_id: String,
 }
 
 fn state_path(buddy: &str) -> PathBuf {
@@ -134,6 +138,13 @@ pub(crate) fn master_key() -> MasterKey {
 
 /// One backup cycle for `buddy_id`: a snapshot when anything changed, and
 /// forget and prune once a day.
+///
+/// Every cycle connects, even when nothing changed, and checks the buddy
+/// still lists the last snapshot saved there. Seen on the test devices
+/// (2026-10-14): a buddy's folder deleted by hand left this side reporting
+/// "backup ok" with nothing on the buddy, and an unchanged folder would
+/// never have been sent again. A missing snapshot means a full backup now.
+/// The check replaces the idle cycle's ping, so it costs the same.
 pub async fn run_backup_cycle(
     endpoint: &Endpoint,
     relay_url: &RelayUrl,
@@ -173,12 +184,6 @@ pub async fn run_backup_cycle(
         })
         .collect();
     let fp = fingerprint(&scan);
-    let retention_due = crate::dashboard::unix_now().saturating_sub(state.last_retention_unix)
-        >= RETENTION_EVERY.as_secs()
-        && state.files > 0;
-    if fp == state.fingerprint && !retention_due {
-        return Ok(BackupCycleStats { files_failed: scan.unreadable.len(), failed_paths, ..Default::default() });
-    }
 
     let cycle_started = Instant::now();
     let addr = EndpointAddr::new(buddy_id).with_relay_url(relay_url.clone());
@@ -187,11 +192,40 @@ pub async fn run_backup_cycle(
     if version < REPO_PROTOCOL {
         conn.close(0u32.into(), b"done");
         anyhow::bail!(
-            "your buddy's client is too old to store your backup (protocol {version}, needs {REPO_PROTOCOL}) —              ask them to update"
+            "your buddy's client is too old to store your backup (protocol {version}, needs {REPO_PROTOCOL}) — ask them to update"
         );
     }
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Sent);
     let quality = netinfo::connection_quality(&conn);
+
+    if !state.fingerprint.is_empty() {
+        let snaps = crate::repo::list(&conn, protocol::RepoFileKind::Snapshot).await?;
+        if backup_lost(&state, &snaps) {
+            tracing::warn!(buddy = %buddy, "the buddy no longer has the backup saved there — backing up in full again");
+            crate::activity::record(
+                crate::activity::kind::PROBLEM,
+                Some(&crate::activity::label(&buddy)),
+                "No longer has your backup (deleted on their side?) — backing it up again in full",
+                Vec::new(),
+            );
+            state = State::default();
+        }
+    }
+    let do_backup = fp != state.fingerprint;
+    let retention_due = crate::dashboard::unix_now().saturating_sub(state.last_retention_unix)
+        >= RETENTION_EVERY.as_secs()
+        && state.files > 0;
+    if !do_backup && !retention_due {
+        let traffic = meter.finish(&conn);
+        conn.close(0u32.into(), b"done");
+        return Ok(BackupCycleStats {
+            connection: Some(quality),
+            traffic: Some(traffic),
+            files_failed: scan.unreadable.len(),
+            failed_paths,
+            ..Default::default()
+        });
+    }
 
     let total_bytes: u64 = scan.files.iter().map(|f| f.size).sum();
     // rustic's byte counter (CycleProgressBars) drives the bar through
@@ -209,7 +243,6 @@ pub async fn run_backup_cycle(
         let rules = Arc::new(scan.rules);
         let counter = tracker.counter.clone();
         let cache = state_dir().join("cache");
-        let do_backup = fp != state.fingerprint;
         tokio::task::spawn_blocking(move || {
             snapshot_and_tidy(backend, &backup_dir, rules, counter, cache, do_backup, retention_due)
         })
@@ -250,6 +283,7 @@ pub async fn run_backup_cycle(
         state.files = total;
         state.bytes = s.map(|s| s.total_bytes_processed).unwrap_or(0);
         state.fingerprint = fp;
+        state.snapshot_id = snap.id.to_hex().to_string();
         tracing::info!(
             buddy = %buddy,
             files_new = new,
@@ -266,6 +300,17 @@ pub async fn run_backup_cycle(
         tracing::warn!(?err, "couldn't save chunked backup state — the next cycle will check everything again");
     }
     Ok(stats)
+}
+
+/// Whether the buddy lost the backup we saved there: our last snapshot
+/// isn't in its list (or, for state from before snapshot ids were kept,
+/// it has no snapshots at all).
+fn backup_lost(state: &State, snaps: &[protocol::RepoFileEntry]) -> bool {
+    if state.snapshot_id.is_empty() {
+        snaps.is_empty()
+    } else {
+        !snaps.iter().any(|s| s.id == state.snapshot_id)
+    }
 }
 
 /// Most CPUs a backup's rustic threads run on. rustic sizes its thread
@@ -615,6 +660,18 @@ fn node_for(entry: &walkdir::DirEntry) -> std::io::Result<Option<Node>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_last_snapshot_means_the_backup_was_lost() {
+        let entry = |id: &str| protocol::RepoFileEntry { id: id.to_string(), size: 1 };
+        let state = State { fingerprint: "f".into(), snapshot_id: "b".repeat(64), ..Default::default() };
+        assert!(!backup_lost(&state, &[entry(&"a".repeat(64)), entry(&"b".repeat(64))]));
+        assert!(backup_lost(&state, &[entry(&"a".repeat(64))]), "only an older one");
+        assert!(backup_lost(&state, &[]));
+        let old = State { fingerprint: "f".into(), ..Default::default() };
+        assert!(!backup_lost(&old, &[entry(&"a".repeat(64))]), "no id kept yet: any snapshot will do");
+        assert!(backup_lost(&old, &[]));
+    }
 
     #[test]
     fn retention_keeps_recent_hourly_then_daily() {

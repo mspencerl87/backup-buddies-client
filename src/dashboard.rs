@@ -1087,7 +1087,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
   .buddy-view { display: none; }
   .buddy-view-on .buddy-view { display: block; }
   .buddy-view-on .modal-search, .buddy-view-on .browse-breadcrumb, .buddy-view-on .modal-actions,
-  .buddy-view-on #browse-list, .buddy-view-on .modal-footer { display: none; }
+  /* !important: the folder view sets the breadcrumb's display inline. */
+  .buddy-view-on #browse-list, .buddy-view-on .modal-footer { display: none !important; }
   .buddy-view p { font-size: 0.82rem; color: var(--text-muted); margin: 0.4rem 0; }
   .stored-list { max-height: 14rem; overflow: auto; margin-top: 0.6rem; border: 1px solid var(--border); border-radius: 8px; }
   .stored-row {

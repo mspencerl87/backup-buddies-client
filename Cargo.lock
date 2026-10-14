@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "backup-buddies-client"
-version = "0.21.0"
+version = "0.21.2"
 dependencies = [
  "anyhow",
  "axum",

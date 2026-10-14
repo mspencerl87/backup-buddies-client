@@ -205,9 +205,11 @@ async fn e2e_chunked_backup() {
     let s = cycle().await.unwrap();
     assert_eq!((s.files_sent, s.files_deleted), (0, 0));
     assert!(s.traffic.is_some(), "connected for retention");
-    // 3. Still nothing changed and retention is done: fully idle.
+    // 3. Still nothing changed and retention is done: idle, but it still
+    // checks the buddy has the backup.
     let s = cycle().await.unwrap();
-    assert!(s.traffic.is_none(), "idle cycles don't connect");
+    assert_eq!((s.files_sent, s.files_deleted, s.bytes_sent), (0, 0, 0));
+    assert!(s.connection.is_some(), "an idle cycle checks with the buddy");
 
     // 4. Rename the big file and move the photos: next to nothing is sent.
     std::fs::rename(mine.join("videos/clip.bin"), mine.join("videos/renamed.bin")).unwrap();
@@ -316,6 +318,16 @@ async fn e2e_chunked_backup() {
     let id = crate::chunked_restore::pack_id(&first.remote).unwrap();
     let peek = crate::chunked_restore::peek_pack(&ep_a, &relay, b_id, id, 256).await.unwrap();
     assert_eq!(peek.len() as u64, first.size.min(256));
+
+    // A buddy that loses the backup (its folder deleted by hand) gets it
+    // again in full on the next cycle, though nothing changed here.
+    std::fs::remove_dir_all(&sender_dir).unwrap();
+    let s = cycle().await.unwrap();
+    assert_eq!((s.files_sent, s.files_deleted), (20, 0), "{s:?}");
+    assert!(crate::repo::repo_size(&sender_dir).await > 32_500_000);
+    assert_eq!(crate::chunked_restore::list(&ep_a, &relay, b_id).await.unwrap().files.len(), 20);
+    let s = cycle().await.unwrap();
+    assert_eq!(s.files_sent, 0, "and then it's idle again");
 
     // 6. A buddy whose pledge is full refuses the next pack, and the cycle
     // says so (the dashboard's DONT_FIT_REASONS matches those words).
