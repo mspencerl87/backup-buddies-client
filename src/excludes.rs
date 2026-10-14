@@ -24,9 +24,8 @@
 //! built-in list is also written, as comments, at the bottom of that file
 //! (see with_builtin_list), so people can see what they'd be overriding.
 //!
-//! Excluding a file that was already backed up is mirrored like a delete:
-//! the buddy keeps the old content as a backup copy for 30 days, then it's
-//! gone (see receive.rs's handle_delete).
+//! Excluding a file that was already backed up works like deleting it: it's
+//! left out of the next snapshot, and older snapshots keep it for 30 days.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -36,15 +35,15 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 pub const FILE_NAME: &str = "excludes.txt";
 
-/// Built-in excludes: files that re-send whole on every small change, can't
-/// be copied consistently while in use, or are regenerated anyway. Kept
+/// Built-in excludes: files that change constantly, can't be copied
+/// consistently while in use, or are regenerated anyway. Kept
 /// conservative: anything a person might reasonably mean to back up (photo
 /// catalogs, encrypted containers, Access databases, VM exports like .xva
 /// or .ova) is left out of this list, since excluding it silently would
 /// cost them their only off-site copy.
 pub const DEFAULTS: &[(&str, &[&str])] = &[
     (
-        "Outlook mail stores (re-sent whole after every new email; OST is a cache of the server)",
+        "Outlook mail stores (changing whenever Outlook runs; OST is a cache of the server)",
         &["(?i)*.pst", "(?i)*.ost"],
     ),
     (
@@ -267,63 +266,6 @@ async fn write_own(own: &str) -> Result<()> {
     tracing::info!("exclude list changed from the dashboard");
     // So the next Rules::load doesn't take this for a hand edit.
     *LAST_LOADED.lock().unwrap() = Some(format!("{}\n{text}", defaults_enabled()));
-    Ok(())
-}
-
-/// `rel_path` as a pattern that matches just that one file: tied to the top
-/// of BACKUP_DIR, with glob characters escaped.
-fn exact_pattern(rel_path: &str) -> String {
-    let mut out = String::from("/");
-    for c in rel_path.chars() {
-        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// `own` with an exclude for exactly `rel_path` added. It goes above the
-/// first pattern line (after the leading comments), so no `!` line can
-/// bring the file back: the first match wins.
-fn with_exact_exclude(own: &str, rel_path: &str) -> String {
-    let pattern = exact_pattern(rel_path);
-    let lines: Vec<&str> = own.lines().collect();
-    if lines.iter().any(|l| l.trim() == pattern) {
-        return own.to_string();
-    }
-    let at = lines
-        .iter()
-        .position(|l| {
-            let l = l.trim();
-            !(l.is_empty() || l == "#" || l.starts_with("//") || l.starts_with("# "))
-        })
-        .unwrap_or(lines.len());
-    let mut out: Vec<String> = lines[..at].iter().map(|l| l.to_string()).collect();
-    out.push("// Kept re-sending (excluded from the dashboard):".to_string());
-    out.push(pattern);
-    if at < lines.len() {
-        out.push(String::new());
-    }
-    out.extend(lines[at..].iter().map(|l| l.to_string()));
-    out.join("\n") + "\n"
-}
-
-/// Excludes exactly `rel_path` — the dashboard's one-click exclude for a
-/// file that keeps re-sending.
-pub async fn exclude_path(rel_path: &str) -> Result<()> {
-    let own = read_own().await?;
-    let updated = with_exact_exclude(&own, rel_path);
-    if !Rules::build(&updated, defaults_enabled())?.is_excluded(rel_path) {
-        anyhow::bail!("couldn't write a pattern that matches {rel_path:?}");
-    }
-    write_own(&updated).await?;
-    crate::activity::record(
-        crate::activity::kind::SETTINGS,
-        None,
-        format!("Excluded {rel_path} (it kept re-sending)"),
-        Vec::new(),
-    );
     Ok(())
 }
 
@@ -617,22 +559,6 @@ mod tests {
         assert!(save_own("[oops").await.is_err());
         assert_eq!(std::fs::read_to_string(dir.join(FILE_NAME)).unwrap(), text, "a bad save changes nothing");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn exact_exclude_goes_above_the_first_pattern() {
-        let own = "// my list\n\n!(?i)*.qcow2\n*.iso\n";
-        let updated = with_exact_exclude(own, "vm/big disk [old].qcow2");
-        assert!(updated.starts_with("// my list\n\n// Kept re-sending"), "{updated}");
-        let r = Rules::build(&updated, true).unwrap();
-        assert!(r.is_excluded("vm/big disk [old].qcow2"), "beats the earlier `!` line");
-        assert!(!r.is_excluded("vm/other.qcow2"));
-        assert!(!r.is_excluded("other/vm/big disk [old].qcow2"), "only that one path");
-        assert_eq!(with_exact_exclude(&updated, "vm/big disk [old].qcow2"), updated, "added once");
-
-        // Only comments (a fresh file): it goes at the end.
-        let fresh = with_exact_exclude(TEMPLATE, "a.db");
-        assert!(fresh.ends_with("// Kept re-sending (excluded from the dashboard):\n/a.db\n"), "{fresh}");
     }
 
     #[test]

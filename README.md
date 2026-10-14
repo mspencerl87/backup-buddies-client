@@ -12,10 +12,11 @@ API who your paired buddies' devices are, then — if this device has
 `BACKUP_DIR` set (which `docker-compose.yml` always does; it just points
 at an empty, read-only folder when you haven't set `BACKUP_DIR_HOST`) —
 scans that folder (skipping anything on the exclude list, see "Excluding
-files"), encrypts anything new or changed with
-`BACKUP_PASSPHRASE`, and sends just the diff to each buddy's device.
-Deleted files are told apart too, so your buddy's copy mirrors yours
-rather than only ever growing. A receive-only device (no `BACKUP_DIR_HOST`
+files") and, when anything changed, saves a new snapshot of it to an
+encrypted repository on each buddy's device, sending only the chunks the
+buddy doesn't have yet (see "How backups are stored"). A deleted file is
+left out of the next snapshot, and older snapshots keep it for 30 days.
+A receive-only device (no `BACKUP_DIR_HOST`
 set) still runs this same cycle against its empty folder every 30
 seconds — you'll see "nothing new to back up" instead of "backup cycle
 complete" every time, not a separate connectivity-only message, so "is
@@ -28,16 +29,15 @@ this still working" never depends on actually having something to send.
   it (directly if possible, through the relay otherwise), and encrypt
   everything with `BACKUP_PASSPHRASE` *before* it ever leaves this
   machine.
-- **Does:** keep sending only the delta each cycle. A cycle lists the
-  folder (metadata only) and only re-reads a file whose size or modified
-  time changed since last time; unchanged files are never read, so an
-  unchanged folder costs a listing, not a re-read. Files whose content
-  changed are re-sent whole (see "Large folders and large files" below).
-- **Does:** keep a short backstop when a file is overwritten or deleted —
-  the live copy plus its last 2 replaced versions are kept on your
-  buddy's disk, browsable and individually restorable from the local
-  dashboard (see "File versions" below). Not full version history, just
-  protection against a bad overwrite or an accidental delete.
+- **Does:** send only what changed. A cycle lists the folder (metadata
+  only); an unchanged folder costs that listing and nothing else. When
+  something changed, only the chunks your buddy doesn't already have are
+  sent: a renamed or moved file costs next to nothing, and an edit to a big
+  file costs about the part that changed.
+- **Does:** keep earlier versions. Every backup with a change is a
+  snapshot, kept every one for a day, hourly for two days and daily for 30
+  days, browsable and restorable from the local dashboard (see "File
+  versions" below).
 - **Does not:** send your passphrase anywhere. It's used locally to
   derive an encryption key and never appears in any API call, log line,
   or network request. If you lose it, data stored with your buddy cannot
@@ -45,9 +45,9 @@ this still working" never depends on actually having something to send.
 - **Does not:** let your buddy read your data. Their client stores
   whatever bytes you send it verbatim, without trying to decrypt them —
   and only ever lets *you* list or fetch back what *you* stored with
-  them, never another buddy's data. Since 0.14.0 file and folder names
-  are encrypted too (see "Encrypted file names" below); your buddy still
-  sees sizes and how your folders are laid out.
+  them, never another buddy's data. They see only encrypted pack files:
+  not your file or folder names, how many files you have, or their sizes
+  (see "How backups are stored").
 
 ## What to back up (and what not to)
 
@@ -67,11 +67,13 @@ file, which is what this handles best.
   so the copy your buddy holds may not open or boot on restore. Back up
   the VM's or database's own export or snapshot instead.
 - **Big files that change all the time** (Outlook PST files, photo
-  catalogs, encrypted containers). They work, but any change re-sends the
-  whole file: a 20 GB file changing daily is around 600 GB a month over
-  both your connections. If it goes through the relay, that counts toward
-  the free monthly relay allowance (syncing pauses past it until the 1st)
-  or is billed per GB on a paid plan. Fine if they rarely change.
+  catalogs, encrypted containers). Only the parts that changed are sent,
+  but a file that's largely rewritten every day still adds up: an
+  encrypted container changes throughout, so a 20 GB one used daily is
+  sent nearly in full each time, around 600 GB a month over both your
+  connections. If it goes through the relay, that counts toward the free
+  monthly relay allowance (syncing pauses past it until the 1st) or is
+  billed per GB on a paid plan. Fine if they rarely change.
 - **Things you can get back anyway:** caches, temp files, downloads,
   games, OS and program folders. They just use up your buddy's pledge.
 - **Keeping your own devices in sync.** This is a one-way backup to
@@ -83,49 +85,47 @@ file, which is what this handles best.
   originals.
 
 The client skips the worst of these by default and lets you exclude
-anything else (see "Excluding files" below). Your buddy can't see file
-contents or names, but does see sizes and how many files and folders
-there are.
+anything else (see "Excluding files" below).
 
-## Encrypted file names (0.14.0)
+## How backups are stored
 
-Your buddy stores your files under encrypted names, so they can't see
-what your files or folders are called. Each part of a path is encrypted
-on its own, the way rclone's crypt remote does it:
-`Photos/2024/IMG_0001.jpg` is stored as `n1/<name>/<name>/<name>`, where
-each `<name>` is a long string of lowercase letters and digits.
+Each buddy keeps a restic-format repository (built with rustic_core) under
+`<your node id>/.repo/` in their buddy files. Files are split into chunks
+by their content, so:
 
-- **How:** AES-SIV (RFC 5297), which always gives the same name for the
-  same input, so a file keeps one name on your buddy's disk and
-  overwrites, backup copies and deletes work as before. Each name is
-  padded to a multiple of 16 bytes first, so exact name lengths are
-  hidden too. The key comes from your passphrase and account, like the
-  file key, so restoring on a rebuilt device brings the names back.
-- **What your buddy still sees:** file sizes, how deep your folders go
-  and how many entries each folder has, how many files you have, and
-  when they change. Like rclone, the same name in two folders encrypts
-  the same way, so your buddy can tell that two folders share a name
-  without knowing what it is.
-- **Long names:** a file or folder name longer than 127 bytes (127
-  characters in plain English, fewer with accented or non-Latin
-  characters) can't fit within filename limits once encrypted. That file
-  isn't backed up: it shows as failed on the dashboard, with the reason,
-  and once in Activity. Shorten the name and it goes out next cycle.
-  Very deep folder trees can hit the same limit.
-- **Updating from an older client:** the first cycle after updating
-  re-sends every file that's already backed up, under its new name, then
-  deletes the copy with the plaintext name. That costs the bandwidth of
-  one full upload; the progress line and Activity say why. Your buddy
-  doesn't need to update for this. Their copies of older versions (from
-  before the update) keep their plaintext names until they're removed
-  after 30 days. History still finds them. Buddies on 0.14.0 also
-  remove the empty plaintext folders left behind.
-- **On the buddy's side**, the dashboard and logs show encrypted names
-  for what you store with them, which is the point.
+- renaming or moving a file or folder sends next to nothing (in testing,
+  renaming a 1 GB file and moving 300 photos stored 0 bytes);
+- editing part of a big file sends only the chunks it touched (1 MB
+  changed in the middle of a 1 GB file: about 1–6 MB);
+- identical content is stored once, wherever it appears.
 
-Changing how names are encrypted would orphan every name already on a
-buddy, so it's versioned: `n1` is scheme 1, and anything on a buddy that
-isn't under `n1/` is a plaintext path from an older client.
+Chunks are encrypted (AES-256-CTR with Poly1305-AES) and packed into
+~32 MB pack files, each named by its SHA-256, which the buddy checks as it
+arrives. Each cycle that finds a change saves a snapshot. Snapshots are
+kept every one for 24 hours, then one per hour up to 2 days, then one per
+day up to 30 days; once a day older ones are forgotten and their space
+freed (prune).
+
+**What your buddy sees:** the pack files, how big each one is (so roughly
+how big your backup is) and when they change. Not your file or folder
+names, how many files you have, their sizes, or anything inside them.
+
+**The key** comes from your passphrase: it goes through scrypt once at
+startup (`log_n=18, r=8`, ~1 s and 256 MB), salted with your account id,
+and the repository's master key is a labelled hash of the result. So the
+passphrase and a device token on the same account restore everything on
+a rebuilt device, no key file is ever written, and the same passphrase
+gives a different key on every account. Passphrase length still matters
+(the client warns under 12 characters).
+
+A backup's threads run on at most 4 CPUs, since rustic_core sizes its
+thread pools to the CPUs it can see (a backup peaked at ~560 MB on 16
+CPUs and ~250 MB on 2 in testing).
+
+Buddies need client 0.16.0 or later to store a repository. Client 0.21.0
+dropped the whole-file backups older clients made: a buddy on a client
+before 0.16.0 fails each cycle with "your buddy's client is too old" until
+they update.
 
 ## Excluding files (0.10.0)
 
@@ -180,23 +180,11 @@ your lines, with the built-in list underneath, and checks a change before
 saving it, so a bad line is shown to you instead of stopping the next
 backup. Editing the file directly still works too.
 
-**Big files that keep re-sending (0.12.0).** Any change re-sends the whole
-file, to every buddy. When a file adds up to at least 1 GB of re-sends over
-3 or more changes in the past week, the dashboard lists it (up to 5, most
-bytes first), e.g. "20.0 GB, re-sent 8 times to 2 buddies this week, 160 GB
-in all", with an **Exclude** button. That adds a line for exactly that file
-near the top of `excludes.txt` (above your other patterns, so a `!` line
-can't bring it back); remove the line to undo it. Only re-sends of a file
-already on the buddy count, not first uploads, and the history is kept for
-30 days in the index. Files that have since been excluded, deleted or moved
-drop off the list.
-
-**Excluding something that's already backed up removes it from your
-buddy**, the same way deleting it would: they keep the last copy for 30
-days (see "File versions"), then it's gone. The log says how many files
-that applies to. If your list would exclude everything while your buddy
-still holds files, the client stops and says so instead of removing them
-all.
+**Excluding something that's already backed up works like deleting it**:
+it's left out of the next snapshot, and older snapshots keep it for 30
+days (see "File versions"). If your list would exclude everything while
+your last snapshot had files, the client stops and says so instead of
+saving an empty snapshot.
 
 ## Running it
 
@@ -239,9 +227,10 @@ This device also serves its own small status page — not to be confused
 with your account dashboard on the website — at
 **http://&lt;this machine's address&gt;:8080** (or whatever `DASHBOARD_PORT`
 you set), once `docker compose up -d` is running. It shows, per buddy:
-their pledge to you and how much of it is used, how many files you've
-sent each other and how much that totals to, and the result of the last
-backup cycle (or ping, for a buddy you're not backing anything up to).
+their pledge to you and how much of it is used, how many files (and how
+much) your last snapshot on their side holds, the size of the backup they
+keep with you, and the result of the last backup cycle (or ping, for a
+buddy you're not backing anything up to).
 There's also a "Restore from this buddy" button, which does the same
 thing as the `restore` command below and writes to the same place
 (`RESTORE_DIR_HOST/<their node id>/`), showing you the result right there
@@ -249,17 +238,16 @@ instead of needing a terminal.
 
 It also has: a file browser with older versions of each file, an
 **Activity** log of what happened (see below), the **Exclusions** editor
-and a list of big files that keep re-sending (see "Excluding files"), and
-the device's disk and bandwidth. It's behind a login set in `.env` (see
+(see "Excluding files"), and the device's disk and bandwidth. It's behind a login set in `.env` (see
 "Logging in").
 
 ### Activity (0.13.0)
 
 Under the buddy cards, **Activity** lists the last 50 things that happened,
-newest first, in plain language: files sent to or removed from a buddy
-(click a line for the file list), a buddy becoming unreachable or failing
-and working again, files a buddy refused, what a buddy stored with you or
-restored from you, restores you ran, exclude-list changes, logins (and
+newest first, in plain language: files backed up to or removed from a
+buddy's snapshot (click a line for the file list), a buddy becoming
+unreachable or failing (a full pledge, say) and working again, what a
+buddy stored with you, pruned or read back, restores you ran, exclude-list changes, logins (and
 wrong passwords, with the address), password changes, startups and
 available updates. The chips filter it to Backups, Problems or Security.
 
@@ -319,8 +307,9 @@ works from a machine configured with the *same* passphrase that encrypted
 the data in the first place, and a `DEVICE_TOKEN` from the same account
 (the key is salted with the account id, so a different account's token
 derives a different key). This is a one-shot operation: the client
-restores everything it's offered and exits, rather than running as part
-of the normal daemon loop.
+restores every file in the latest snapshot and exits, rather than running
+as part of the normal daemon loop. Earlier versions, and deleted files,
+restore from the dashboard's History.
 
 ## Building locally
 
@@ -417,30 +406,21 @@ The client uses four separate folders, each bind-mounted from the host
 | `RESTORE_DIR_HOST` (default `./restored`) | `/restored` (`RESTORE_DIR`) | Files you restore from a buddy. |
 
 `BUDDY_FILES_DIR` and `RESTORE_DIR` default to `DATA_DIR/received` and
-`DATA_DIR/restored` when unset — the layout before they were split out — so
-an older install that hasn't added them keeps working. If `BUDDY_FILES_DIR`
-points at an empty folder while buddy files are still in `DATA_DIR/received`
-(what an existing install gets after `install.sh --update` brings in the new
-`docker-compose.yml` but keeps its `.env`), the client keeps using the old
-location and logs a warning with how to move them — starting on the empty
-folder would make its buddies' backups look missing while `usage.json` still
-counted them. If *both* folders hold buddy files, it refuses to start until
-they're merged. Pointing `BUDDY_FILES_DIR_HOST` at the old
-`DATA_DIR_HOST/received` folder is fine — it's detected as the same folder.
+`DATA_DIR/restored` when unset.
 
 Config (`DATA_DIR`):
 
 - `iroh_secret_key` — this device's identity. Deleting it means the
   device re-registers under a new identity next startup (update it on
   your dashboard, or just remove and re-add the device there).
-- `index.sqlite` (+ `-wal`/`-shm`) — this device's index (SQLite): the
-  size, modified time and hash of each file in `BACKUP_DIR`, and per
-  buddy, what was last sent them (path, size, hash, encrypted size).
-  Updated one row at a time as files land. Deleting it means the next
-  cycle re-reads every file and re-sends everything — wasteful, but
-  harmless; it doesn't affect what's actually stored on either side.
-  Replaces the old `manifest-<buddy>.json` files, which are imported on
-  first start of 0.5.0 and renamed `*.json.migrated` (safe to delete).
+- `chunked/` — per buddy, a fingerprint of the folder at the last
+  snapshot (so an unchanged folder needs no connection) and when old
+  snapshots were last pruned, plus rustic's cache of repository index and
+  tree data. Deleting it means the next cycle reads every file once more,
+  sending only what the buddy doesn't have; it doesn't affect what's
+  stored on either side.
+- `index.sqlite` (+ `-wal`/`-shm`) — the dashboard's Activity events
+  (SQLite). Deleting it just empties the Activity card.
 - `usage.json` — `{ "<buddy node id>": <bytes received from them> }`,
   tracked per buddy device and checked against their pledge
   (`buddy_pairings.pledged_bytes`, fetched from the API every 30s) before
@@ -455,21 +435,17 @@ Config (`DATA_DIR`):
 
 Buddy files (`BUDDY_FILES_DIR`):
 
-- `<buddy node id>/` — the actual files a buddy has backed up with you,
-  stored encrypted, under `n1/` with encrypted file and folder names
-  (buddies on clients before 0.14.0 send their real relative paths).
-  This device never attempts to decrypt them — it has no reason to ever
-  hold the sender's passphrase.
-- `<buddy node id>/.versions/` — backup slots for that buddy's files,
-  kept when a file is overwritten or deleted (see "File versions" below).
-  Deleting this folder just gives up that recovery history; it doesn't
-  touch the live files.
-- `<buddy node id>/.repo/` — a buddy's chunked backup (client 0.16.0+
-  stores these; sending them comes in a later version): encrypted pack,
-  index and snapshot files in the restic repository layout, named by
-  their content hashes. It holds the whole backup, history included, and
-  counts against that buddy's pledge in full. Don't edit or delete
-  anything in it by hand; a missing pack loses whatever was in it.
+- `<buddy node id>/.repo/` — a buddy's backup: encrypted pack, index and
+  snapshot files in the restic repository layout, named by their content
+  hashes. It holds the whole backup, history included, and counts against
+  that buddy's pledge in full. This device never attempts to decrypt it —
+  it has no reason to ever hold the sender's passphrase. Don't edit or
+  delete anything in it by hand; a missing pack loses whatever was in it.
+- `<buddy node id>/.incoming/` — writes in progress, moved into `.repo/`
+  once complete and checked; cleared at startup.
+
+Anything else in a buddy's folder (whole files and `.versions/` from
+clients before 0.21.0) isn't used or counted any more; delete it by hand.
 
 A folder whose node id isn't one of your buddies' devices any more (their
 client got a new identity, or the pairing ended) is removed 30 days after
@@ -498,51 +474,31 @@ stat every stored file. Unset, the client runs as root as before.
   `DATA_DIR/buddy-files-id`. If they don't match on a later start — most
   often a drive that wasn't mounted yet, so Docker bound the empty mount
   point — the client refuses to start rather than storing buddy files on
-  the wrong disk. Deleting `buddy-files-id` deliberately starts over. A
-  marker left behind by `mv received/* new/` (globs skip dotfiles) is
-  carried over automatically, but only once the new folder has files in it.
+  the wrong disk. Deleting `buddy-files-id` deliberately starts over.
 - **Your files:** if `BACKUP_DIR` scans completely but comes back empty
-  while the buddy holds files from it, the cycle fails with an explanation
-  instead of sending a delete for every file. `ALLOW_EMPTY_BACKUP_DIR=true`
+  while your last snapshot had files, the cycle fails with an explanation
+  instead of saving an empty snapshot. `ALLOW_EMPTY_BACKUP_DIR=true`
   overrides it; remove it again afterwards (the client warns at startup
   while it's set).
-- **Unreadable files or folders:** an unreadable file is reported as a
-  failed file and the rest of the cycle carries on (it used to abort the
-  whole cycle). An unreadable folder is reported and pauses *all*
-  deletions that cycle — its contents would otherwise look deleted.
+- **Unreadable files or folders:** reported on the dashboard as files that
+  can't be backed up, and left out of that snapshot; the rest is backed up
+  as usual. Older snapshots keep what they had, for 30 days.
 
-## Backup progress on the dashboard (0.5.1)
+## Backup progress on the dashboard
 
 While a backup cycle runs, each buddy card on the local dashboard shows a
-progress bar: "checking files" (how many checked, and how far through a
-changed file it's reading), then "backing up" (files and bytes done, speed,
-time left, current file). It disappears when the cycle ends and the normal
-last-cycle line takes over. Served as `in_progress` on each buddy in
-`/api/status`.
+progress bar: "checking" while the folder is scanned, then "backing up"
+(bytes read of the folder's total, speed and time left). A backup reads
+every file but sends only new chunks, so it's measured in bytes read. It
+disappears when the cycle ends and the normal last-cycle line takes over.
+Served as `in_progress` on each buddy in `/api/status`.
 
-## Interrupted uploads resume (0.8.0)
+## Dropped connections
 
-A big file (256 MB or more) whose upload is cut off partway — a dropped
-connection, a restart on either side — carries on from where it stopped on
-a later cycle instead of starting again from zero.
-
-Because every encryption uses a fresh random key, re-encrypting the file
-would give different bytes, so the sender keeps the exact encrypted copy
-it's sending in `DATA_DIR/outgoing/` and resumes from that. The copy is
-encrypted like everything that leaves this machine, and is deleted as
-soon as the buddy confirms the file. The buddy keeps the partial upload
-under `<sender>/.incoming/resume/`, and only stores the file once the
-hash of the whole thing checks out.
-
-- Needs both buddies on 0.8.0. With an older buddy, uploads work as before.
-- The copy needs free space on DATA_DIR's disk about the size of the file
-  (plus 1 GB to spare). Without it, the file is sent the old way, with no
-  resume.
-- If the file changes before the upload finishes, both copies are
-  discarded and the new version is sent whole.
-- If the sender's client is stopped while it's still encrypting, that copy
-  can't be resumed from and the file starts over (once). Copies and
-  partials nobody comes back for are deleted after 7 days.
+A connection that drops mid-backup is reopened and the call tried again,
+up to 3 times, without starting the cycle over. If the backup still fails,
+the next cycle (about 30 seconds later) runs it again. A refusal (pledge or
+disk full) isn't retried; the cycle reports it.
 
 ## Known issue: dropped connections between two clients on one machine
 
@@ -550,54 +506,37 @@ With two clients on the same machine backing up to each other, a long
 transfer occasionally loses its connection partway through, usually
 minutes in, logged as
 `failed closing path err=LastOpenPath` and then `connection lost` /
-`timed out`. The next cycle carries on: big files resume (above), smaller
-ones are re-sent. Seen only with two clients on the same machine, where
+`timed out`. The client reconnects and carries on (above). Seen only with two clients on the same machine, where
 every interface address, including the Docker bridge (`docker0`,
 172.17.0.1), is offered as a route. Between two separate machines on one
 local network, about 21 GB over three long transfers ran clean.
 
-## Large folders and large files (0.5.0)
+## Large folders and large files
 
-- **Change detection:** see `index.sqlite` above — an unchanged file is
-  never read again. `SCAN_INTERVAL_SECS` (default 30, minimum 5) sets how
-  often a cycle runs; staleness on the dashboard scales with it.
-- **Streaming:** hashing, encryption, upload, storage on the buddy's side,
-  download and decryption all stream in ~256 KiB pieces, so memory doesn't
-  depend on file size (tested: a 6 GB file on a 7 GB-RAM machine, peak
-  ~263 MB, almost all of it the one-time key derivation below). The
-  per-file limit is 1 TB (was 5 GB). Uploads land in a hidden `.incoming/`
-  folder on the buddy's side and are moved into place only once complete
-  and verified; leftovers from an interrupted upload are cleared on start.
-  Restores are written to a temporary file and moved into place only once
-  the whole file decrypted and authenticated.
-- **Encryption key:** files used to be encrypted straight to the
-  passphrase, which runs scrypt (~1.5 s of CPU) for *every* file — 20,000
-  photos took ~8 hours. Now the passphrase goes through scrypt once at
-  startup (`log_n=18, r=8`, ~1 s and 256 MB, fixed salt) to derive an
-  X25519 key, and files are encrypted to that key. The passphrase alone
-  still recovers everything; files encrypted the old way still restore
-  (decryption tries both). Trade-off of the fixed salt: weak passphrases
-  are easier to attack in bulk, so passphrase length matters (the client
-  warns under 12 characters); a per-account salt is on the launch
-  checklist as later hardening.
-- **Large file lists:** a buddy's file list is sent in chunks of 5,000
-  (`ListStream`) — the old single-message list broke above ~10,000 files,
-  which broke reconciliation, restore and the file browser.
-- **Mixed versions:** an updated client asks a buddy its protocol version
-  (`Hello`) before uploading. A buddy still on ≤0.4 gets the old upload
-  format, limited to files up to 512 MB (the old format needs the whole
-  encrypted file in memory to hash it first); bigger files wait, reported
-  as "your buddy's client is out of date". Updated clients still accept
-  every old request, so an old client keeps working against a new one.
+- **Change detection:** each cycle lists the folder (paths, sizes and
+  modified times only) and compares a fingerprint of that with the last
+  snapshot's; when they match, nothing is read and no connection is made.
+  When they don't, rustic reads files whose size or modified time changed
+  since the parent snapshot (inode and ctime are ignored, since they
+  change across an SMB/NFS remount) and sends only new chunks.
+  `SCAN_INTERVAL_SECS` (default 30, minimum 5) sets how often a cycle
+  runs; staleness on the dashboard scales with it.
+- **Memory:** bounded by rustic and the 4-CPU cap above, not by file
+  size or count. Restores don't use rustic's own restore (it reads on many
+  threads with no backpressure, and panics on a failed read): each file is
+  read in 4 MiB pieces into a temporary file and moved into place once
+  complete. Repository files land in a hidden `.incoming/` folder on the
+  buddy's side and are moved into place only once complete and checked.
+- **Large repositories:** the buddy lists repository files in chunks of
+  5,000 (`RepoList`), so any number of packs and snapshots works.
 - Tested end to end (`src/e2e_tests.rs`): two real endpoints over
-  localhost, real send/receive/reconcile/restore code. 20,000 small files:
-  first backup 41 s (was ~8 h), unchanged cycle 0.14 s, restore 23 s.
+  localhost, the real backup, receive and restore code.
 
 ## Disk safety: pledges vs. the real disk
 
 A pledge is just a number two accounts agreed on over the API — it's not a
 reservation the filesystem enforces. On top of the per-buddy pledge check
-above, every incoming file is also checked against the *real* free space on
+above, every incoming pack is also checked against the *real* free space on
 the filesystem under `BUDDY_FILES_DIR` — where incoming files actually land,
 which may be a different disk from `DATA_DIR` (`statvfs`, same mechanism the
 dashboard's Disk card and the buddy disk-stats probe read). A write that would eat into a floor of whichever is
@@ -679,52 +618,26 @@ actually is wired up to billing.
 
 ## File versions — protection against overwrites and accidental deletes
 
-A buddy's copy used to just mirror yours exactly: whatever you last sent
-them is all they have. Now, whenever a file you'd already backed up gets
-overwritten or deleted, the previous content isn't discarded — it's kept
-as a numbered backup slot (`.versions/` inside that buddy's folder in `BUDDY_FILES_DIR`
-on the receiving end), up to the 2 most recent replacements. So at
-any time, up to 3 copies of a file exist on your buddy's disk: the current
-one (if it still exists) plus its last 2 predecessors. A delete isn't
-destructive either — the deleted content becomes the newest backup slot
-rather than vanishing, so a fat-fingered local delete is recoverable the
-same way a bad overwrite is.
+Every backup with a change is a snapshot, so a file you overwrite or
+delete is still in the snapshots from before, which are kept every one for
+24 hours, hourly for 2 days and daily for 30 days.
 
-To get one back: open **Browse files** on a buddy's card, click
-**History** next to a file, and pick a version to restore. It's written
-to `RESTORE_DIR/<buddy>/<path>.v<N>.bak` — alongside, never over, a
+To get one back: open **Browse files** on a buddy's card. Deleted files
+(and the old names of renamed ones) are listed too, marked "deleted —
+recoverable". Click **History** next to a file and pick a version: each
+distinct earlier content, newest first, with when it's removed. It's
+written to `RESTORE_DIR/<buddy>/<path>.v<N>.bak` — alongside, never over, a
 normal restore of that file — so you can compare before deciding what to
 keep.
 
-This is a backstop against corruption, a bad sync, or an accidental local
-delete, not full version history — only the live copy and its last 2
-predecessors are kept.
-
-**Backup copies are kept for 30 days (0.8.2).** A copy is removed for good
-30 days after it was replaced or deleted (History shows "kept … ago,
-removed in N days"). The buddy storing it does this, at startup and once a
-day. Pledges only count live files, so without a limit, someone who backs
-up 100 GB, deletes it and backs up another 100 GB would leave 200 GB on
-their buddy's disk against a 100 GB pledge. Copies made before 0.8.2 are
-dated by when they were uploaded, so the first run after updating re-dates
-them to that day instead of removing them. Buddies on older clients keep
-copies indefinitely.
-
-**Delete permanently (0.9.0).** To free the space sooner, a deleted file
-in **Browse files** has a **Delete permanently** button. After a
-confirmation, the buddy removes the copies it's keeping of that file, so it
-can no longer be restored. Only files you've already deleted have the
-button, and the buddy refuses if the file still exists there, so it can't
-remove a current file. Both buddies need 0.9.0.
+A file can't be cut out of existing snapshots, so its copies go when those
+snapshots age out; there's no "delete permanently".
 
 **What your buddy sees (0.15.0).** **Browse files** has a **What your
-buddy sees** button that lists your files the way they sit on the buddy's
-disk: encrypted names and stored sizes. Click one to see its first 256
-bytes exactly as stored, an `age-encryption.org/v1` header and then
-ciphertext, so you can check for yourself that nothing on their side is
-readable. It reads the file with the same request a restore uses, so it
-works with buddies on any version. A name stored by a client before 0.14.0
-shows as readable until it's re-sent under an encrypted one.
+buddy sees** button that lists the pack files your backup is stored in, as
+they sit on the buddy's disk, with their sizes. Click one to see its first
+256 bytes exactly as stored, so you can check for yourself that nothing on
+their side is readable.
 
 ## Buddy health — staleness and per-file failures
 
@@ -737,11 +650,12 @@ default — see `.env.example`), a red **stale** badge shows up next to
 their status, saying how long it's actually been since something last
 went through.
 
-Separately, if specific files keep failing to send or delete while the
-cycle otherwise runs fine, they're called out by name under that buddy's
-card (capped at the first 10, if there are more) rather than just logged
-and silently retried forever in the background. A cycle with any failing
-files is no longer reported as fully "ok" either, for the same reason.
+Separately, if specific files can't be read while the cycle otherwise runs
+fine, they're called out by name under that buddy's card (capped at the
+first 10, if there are more) rather than just logged. A cycle with any
+failing files isn't reported as fully "ok" either, for the same reason. A
+buddy whose pledge or disk is full shows an amber "doesn't fit" instead of
+a red failure: the last snapshot is still there.
 
 ## Relay bandwidth
 
@@ -766,51 +680,6 @@ a monthly relay allowance instead (shown on the billing card); past it,
 buddy syncing pauses until the 1st of the next month, or until the
 account subscribes.
 
-## Chunked backups
-
-Since 0.19.0, a buddy on client 0.16.0 or later gets a chunked backup
-instead of one encrypted copy per file: a restic-format
-repository (built with rustic_core) under `<your node id>/.repo/` in their
-buddy files. Files are split into chunks by their content, so:
-
-- renaming or moving a file or folder sends next to nothing (in testing,
-  renaming a 1 GB file and moving 300 photos stored 0 bytes);
-- editing part of a big file sends only the chunks it touched (1 MB
-  changed in the middle of a 1 GB file: about 1–6 MB);
-- identical content is stored once, wherever it appears.
-
-Each cycle that finds a change saves a snapshot. Snapshots are kept every
-one for 24 hours, then one per hour up to 2 days, then one per day up to
-30 days; once a day older ones are forgotten and their space freed. The
-buddy sees only encrypted pack files (how big they are and when they
-change), not your file names, how many files you have, their sizes or
-your folders. The repository's key comes from
-your passphrase, like the file key, so the passphrase alone still
-restores everything.
-
-Browse files, restores and History work on a chunked backup the same way
-(since 0.18.0): the file list is the latest snapshot, deleted files (and
-the old names of renamed ones) are listed from older snapshots, and a
-file's History offers each earlier version that's still kept. "Delete
-permanently" isn't offered: a file can't be cut out of existing
-snapshots, so its copies go when those snapshots age out. "What your
-buddy sees" shows the pack files as they sit on the buddy's disk.
-
-Buddies on older clients keep getting whole files. Switching an existing
-whole-file backup over uploads everything once more, into the new format.
-Once that first snapshot is saved (and every file in your backup folder
-could be read), the whole-file copies on the buddy are deleted there, so
-they stay as backup copies for 30 days, like anything else you delete;
-Activity says when.
-
-A backup's threads run on at most 4 CPUs, since rustic_core sizes its
-thread pools to the CPUs it can see (a backup peaked at ~560 MB on 16
-CPUs and ~250 MB on 2 in testing).
-
-`CHUNKED_TRANSFERS=off` goes back to whole files: everything is sent as
-whole files again, and Browse files shows those. The chunked backup stays
-on the buddy, unused, until you turn it back on.
-
 ## Commands and settings
 
 Everything you can run or set, in one place. The sections above explain
@@ -829,7 +698,7 @@ Run these from the folder with your `docker-compose.yml` and `.env`.
 | `docker compose down` | Stop |
 | `docker compose pull && docker compose up -d` | Update an image install by hand |
 | `gh attestation verify oci://ghcr.io/mspencerl87/backup-buddies/client:<version> --repo mspencerl87/backup-buddies` | Check an image was built by the public repo's CI, and from which commit (see "Verifying the image") |
-| `docker compose run --rm client restore <buddy node id> [dir]` | One-shot restore of everything that buddy holds for you, decrypted, then exits. `<buddy node id>` is required (Buddies card). `[dir]` is optional and is a path *inside the container*; the default is `/restored/<node id>`, which is `RESTORE_DIR_HOST/<node id>` on the host. Needs the same `BACKUP_PASSPHRASE` and a device token from the same account |
+| `docker compose run --rm client restore <buddy node id> [dir]` | One-shot restore of every file in your latest snapshot on that buddy, decrypted, then exits. `<buddy node id>` is required (Buddies card). `[dir]` is optional and is a path *inside the container*; the default is `/restored/<node id>`, which is `RESTORE_DIR_HOST/<node id>` on the host. Needs the same `BACKUP_PASSPHRASE` and a device token from the same account |
 | `cargo build --release` | Build from source (Rust 1.85+, edition 2024) |
 | `docker build -t backup-buddies-client .` | Build the image yourself |
 
@@ -874,8 +743,7 @@ explanations.
 | `SCAN_INTERVAL_SECS` | `30` | How often to look for changes and sync, in seconds. At least 5 |
 | `STALE_AFTER_SECS` | `600`, or 3× the scan interval if longer | How long without a successful cycle before the dashboard calls a buddy stale |
 | `DEFAULT_EXCLUDES` | on | `off` (or `false`, `0`, `no`) stops skipping the built-in list of poor fits (PST, live databases, VM disks, temp files). See "Excluding files" |
-| `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder sync as "everything deleted". Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
-| `CHUNKED_TRANSFERS` | on | Backs up to buddies on 0.16.0+ in chunks, so renames and moves cost nothing and edits send only what changed. `off` (or `false`, `0`, `no`) sends whole files instead. See "Chunked backups" |
+| `ALLOW_EMPTY_BACKUP_DIR` | off | `true` (or `1`, `yes`) lets an empty backup folder be backed up as an empty snapshot. Set it for one restart after a deliberate cleanup, then remove it: while on, it disables the missing-drive guard |
 | `UPDATE_CHECK_URL` | derived from `API_URL` (`https://app.filegarden.net/client/Cargo.toml`) | Where to check for a newer version (every hour). `off` disables the check |
 
 **Set by the image or compose file; don't set these yourself**
@@ -904,16 +772,14 @@ reached.
 | `POST /api/excludes` | Save your exclude lines: body `{"own": "..."}`. `400` with the reason if a line is invalid (nothing is saved) |
 | `GET /api/activity?filter=&limit=` | Activity events, newest first. `filter`: `all` (default), `backups`, `problems` or `security`; `limit` default 50, at most 200 |
 | `GET /api/logs` | The last 300 log lines (memory only) |
-| `POST /api/excludes/add` | Exclude exactly one file: body `{"path"}`, relative to the backup folder. Used by the re-sending list's Exclude button |
-| `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, big files that keep re-sending, and per-buddy pledges, usage, health and bandwidth |
-| `GET /api/buddies/<node_id>/files` | What that buddy holds for you right now: each file's real `path`, its stored (encrypted) name `remote`, size and whether it was deleted |
+| `GET /api/status` | Everything the page shows: this device, version and update status, disk, the last backup cycle, and per-buddy pledges, usage, health and bandwidth |
+| `GET /api/buddies/<node_id>/files` | Your backup on that buddy: `files` (each file's `path`, `size` and whether it's `deleted`, i.e. only in older snapshots) and `stored` (the pack files as the buddy holds them: `remote`, `size`) |
 | `GET /api/buddies/<node_id>/disk` | That buddy's real disk space and total commitments |
-| `GET /api/buddies/<node_id>/versions?path=<path>` | Older saved copies of one file |
-| `GET /api/buddies/<node_id>/peek?path=<remote>` | The first 256 bytes of one stored file exactly as that buddy holds it (still encrypted), as `{"path", "hex"}`. For "What your buddy sees" |
+| `GET /api/buddies/<node_id>/versions?path=<path>` | Earlier versions of one file across the snapshots still kept |
+| `GET /api/buddies/<node_id>/peek?path=<remote>` | The first 256 bytes of one pack (a `remote` from `stored`) exactly as that buddy holds it (still encrypted), as `{"path", "hex"}`. For "What your buddy sees" |
 | `POST /api/restore/<node_id>` | Restore to `RESTORE_DIR_HOST/<node_id>/`. Body `{"paths": [...]}`; empty or missing means everything |
 | `GET /api/buddies/<node_id>/restore-progress` | Progress of the latest restore from that buddy (`{"active": false}` if none) |
-| `POST /api/restore-version/<node_id>` | Restore one older copy. Body `{"path", "version"}`. It's written next to the normal restore with a suffix and never overwrites it |
-| `POST /api/buddies/<node_id>/purge` | "Delete permanently": body `{"path"}`. Asks the buddy to drop the saved copies of a file you've deleted. Refused while the file still exists |
+| `POST /api/restore-version/<node_id>` | Restore one earlier version. Body `{"path", "version"}`. It's written next to the normal restore with a suffix and never overwrites it |
 
 ### What it sends to the service
 
@@ -934,13 +800,12 @@ are never sent to the service.
 Clients talk to each other directly over Iroh (QUIC), ALPN
 `backup-buddies/sync/1`, falling back to the relay when needed. Each
 request is a framed message (`src/protocol.rs`): `Hello` (protocol
-version, currently 4), `Ping`, `Put` / `PutStream` / `PutResumable`
-(upload, the last one resumable for large files), `Delete`, `List` /
-`ListStream`, `Get`, `DiskStats`, `ListVersions`, `GetVersion` and
-`PurgeDeleted`. A buddy only ever lists, returns or deletes what the
-connecting device itself stored there, identified by its node id. Paths
-are opaque to the buddy: since 0.14.0 the sender sends encrypted names
-(see "Encrypted file names"), which needed no protocol change.
+version, currently 5), `Ping`, `DiskStats`, and the repository calls
+`RepoList`, `RepoRead`, `RepoWrite` and `RepoRemove`, which store, list,
+read and remove opaque repository files by kind and id. A buddy only ever
+lists, returns or removes what the connecting device itself stored there,
+identified by its node id. The whole-file requests of protocol versions
+1–4 were dropped in client 0.21.0.
 
 ## License
 

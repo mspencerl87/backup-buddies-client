@@ -13,8 +13,7 @@
 //! stream). A connection that dropped is reopened and the call tried again;
 //! anything else (a missing file, a hash mismatch) would fail the same way
 //! twice, so it isn't. Neither is a buddy refusing a write because the
-//! pledge or its disk is full: the refusal is kept for the caller to report,
-//! like a refused whole-file upload.
+//! pledge or its disk is full: the refusal is kept for the caller to report.
 
 use std::future::Future;
 use std::sync::Mutex;

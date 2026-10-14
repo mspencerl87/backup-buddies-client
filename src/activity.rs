@@ -109,17 +109,17 @@ pub fn buddy_health(node_id: &str, label: &str, ok: bool, detail: &str, path: Op
     }
 }
 
-/// What one buddy did on one incoming connection, summed and recorded as
-/// one event when they disconnect (a backup cycle of 500 files is one
-/// line, not 500).
+/// What one buddy did to the backup they keep with us on one incoming
+/// connection, summed and recorded as one event when they disconnect (a
+/// backup of 500 packs is one line, not 500). Packs only: the repository's
+/// small index and snapshot files would only add noise.
 #[derive(Default)]
 struct Tally {
     stored: usize,
     stored_bytes: u64,
-    deleted: usize,
-    fetched: usize,
+    removed: usize,
+    removed_bytes: u64,
     fetched_bytes: u64,
-    purged: usize,
 }
 
 static INCOMING: Mutex<Option<HashMap<String, Tally>>> = Mutex::new(None);
@@ -135,19 +135,18 @@ pub fn incoming_stored(node_id: &str, bytes: u64) {
     });
 }
 
-pub fn incoming_deleted(node_id: &str) {
-    tally(node_id, |t| t.deleted += 1);
-}
-
-pub fn incoming_fetched(node_id: &str, bytes: u64) {
+/// A pack removed by the buddy's prune (old snapshots aged out).
+pub fn incoming_removed(node_id: &str, bytes: u64) {
     tally(node_id, |t| {
-        t.fetched += 1;
-        t.fetched_bytes += bytes;
+        t.removed += 1;
+        t.removed_bytes += bytes;
     });
 }
 
-pub fn incoming_purged(node_id: &str) {
-    tally(node_id, |t| t.purged += 1);
+/// Pack bytes read back: a restore, Browse files or History, or a prune
+/// repacking what's still needed.
+pub fn incoming_fetched(node_id: &str, bytes: u64) {
+    tally(node_id, |t| t.fetched_bytes += bytes);
 }
 
 /// Records what `node_id` did over the connection that just closed.
@@ -156,22 +155,19 @@ pub fn flush_incoming(node_id: &str) {
     let who = label(node_id);
     let mut parts = Vec::new();
     if t.stored > 0 {
-        parts.push(format!("stored {} ({}) with you", plural(t.stored, "file"), fmt_bytes(t.stored_bytes)));
+        parts.push(format!("stored {} ({}) of their backup with you", plural(t.stored, "pack"), fmt_bytes(t.stored_bytes)));
     }
-    if t.deleted > 0 {
-        parts.push(format!("deleted {}", plural(t.deleted, "file")));
-    }
-    if t.purged > 0 {
-        parts.push(format!("permanently removed the kept copies of {}", plural(t.purged, "file")));
+    if t.removed > 0 {
+        parts.push(format!("removed {} ({}) they no longer need", plural(t.removed, "pack"), fmt_bytes(t.removed_bytes)));
     }
     if !parts.is_empty() {
         record(kind::INCOMING, Some(&who), capitalize(&parts.join(", ")), Vec::new());
     }
-    if t.fetched > 0 {
+    if t.fetched_bytes > 0 {
         record(
             kind::INCOMING,
             Some(&who),
-            format!("Restored {} ({}) from what you hold for them", plural(t.fetched, "file"), fmt_bytes(t.fetched_bytes)),
+            format!("Read back {} of the backup you hold for them", fmt_bytes(t.fetched_bytes)),
             Vec::new(),
         );
     }
@@ -252,9 +248,9 @@ mod tests {
     fn incoming_tally_adds_up_per_buddy() {
         incoming_stored("tally-test-buddy", 100);
         incoming_stored("tally-test-buddy", 50);
-        incoming_deleted("tally-test-buddy");
+        incoming_removed("tally-test-buddy", 30);
         let guard = INCOMING.lock().unwrap();
         let t = &guard.as_ref().unwrap()["tally-test-buddy"];
-        assert_eq!((t.stored, t.stored_bytes, t.deleted), (2, 150, 1));
+        assert_eq!((t.stored, t.stored_bytes, t.removed, t.removed_bytes), (2, 150, 1, 30));
     }
 }

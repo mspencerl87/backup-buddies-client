@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Spencer LeBlanc
 
-//! Browse files, History and restores for a chunked backup (chunked.rs),
-//! answering in the same shapes as whole-file ones (restore.rs), so the
-//! dashboard doesn't need to know which kind a buddy has.
+//! Browse files, History and restores for the backup on a buddy
+//! (chunked.rs).
 //!
 //! - Files: the latest snapshot. A file missing from it but present in any
-//!   older one is listed as deleted, like a whole file that only survives
-//!   as backup copies (so after a rename, the old name is still there to
-//!   restore from).
+//!   older one is listed as deleted, still restorable from History (so
+//!   after a rename, the old name is still there to restore from).
 //! - History: the file's distinct earlier contents across all snapshots,
-//!   newest first, so hourly and daily restore points instead of the two
-//!   copies a whole file keeps.
+//!   newest first: hourly and daily restore points.
 //! - Restores don't use rustic's own restore: in a spike it read on 20
 //!   threads with no backpressure (1.9 GB of memory restoring 1.9 GB) and
 //!   unwraps every read, so one failed network read would crash the
@@ -31,16 +28,27 @@ use rustic_core::{
 };
 
 use crate::netinfo;
-use crate::protocol::{self, VersionEntry};
+use crate::protocol;
 use crate::receive::safe_join;
 use crate::repo_backend::BuddyBackend;
 use crate::restore::{BuddyFile, ProgressHandle, RestoreStats};
 
 const READ_PIECE: usize = 4 * 1024 * 1024;
 
-/// Backup copies of a whole file go after 30 days; old snapshots age out
-/// on the same schedule (chunked.rs's retention), so History says so too.
+/// Old snapshots age out after 30 days (chunked.rs's retention), so
+/// History says when each earlier version goes.
 const KEPT_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// One earlier content of a file, for the dashboard's History.
+#[derive(Debug, serde::Serialize)]
+pub struct VersionEntry {
+    pub version: u32,
+    pub size: u64,
+    /// When the snapshot holding it was taken.
+    pub modified_unix: Option<u64>,
+    /// When that snapshot ages out.
+    pub expires_unix: Option<u64>,
+}
 
 /// One pack file as the buddy stores it, for "What your buddy sees".
 #[derive(Debug, Clone, serde::Serialize)]
@@ -68,6 +76,12 @@ async fn connect(
     let conn = endpoint.connect(addr, protocol::ALPN).await.map_err(protocol::explain_connect_error)?;
     let backend = Arc::new(BuddyBackend::new(endpoint.clone(), relay_url.clone(), buddy_id, Some(conn.clone())));
     Ok((conn, backend))
+}
+
+/// Whether there's a repository on the buddy at all (a first backup
+/// creates it).
+fn exists(backend: &BuddyBackend) -> Result<bool> {
+    Ok(!backend.list(rustic_core::FileType::Config)?.is_empty())
 }
 
 fn open(backend: Arc<BuddyBackend>) -> Result<Repo> {
@@ -201,6 +215,9 @@ pub async fn list(endpoint: &Endpoint, relay_url: &RelayUrl, buddy_id: EndpointI
     let job = {
         let backend = backend.clone();
         tokio::task::spawn_blocking(move || -> Result<Listing> {
+            if !exists(&backend)? {
+                return Ok(Listing { files: Vec::new(), packs: Vec::new() });
+            }
             let packs = backend
                 .list_with_size(rustic_core::FileType::Pack)?
                 .into_iter()
@@ -231,8 +248,8 @@ pub async fn list(endpoint: &Endpoint, relay_url: &RelayUrl, buddy_id: EndpointI
             }
             let mut files: Vec<BuddyFile> = live
                 .into_iter()
-                .map(|(path, node)| BuddyFile { path, size: node.meta.size, deleted: false, remote: String::new() })
-                .chain(deleted.into_iter().map(|(path, size)| BuddyFile { path, size, deleted: true, remote: String::new() }))
+                .map(|(path, node)| BuddyFile { path, size: node.meta.size, deleted: false })
+                .chain(deleted.into_iter().map(|(path, size)| BuddyFile { path, size, deleted: true }))
                 .collect();
             files.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(Listing { files, packs })
@@ -273,6 +290,9 @@ pub async fn list_versions(
     let job = {
         let backend = backend.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<VersionEntry>> {
+            if !exists(&backend)? {
+                return Ok(Vec::new());
+            }
             let repo = open(backend)?;
             let snaps = snapshots(&repo)?;
             Ok(versions_of(&repo, &snaps, &path)
@@ -354,6 +374,9 @@ pub async fn restore_files(
     let job = {
         let backend = backend.clone();
         tokio::task::spawn_blocking(move || -> Result<(usize, u64)> {
+            if !exists(&backend)? {
+                return Ok((0, 0));
+            }
             let repo = open(backend)?;
             let snaps = snapshots(&repo)?;
             let Some(latest) = snaps.first() else { anyhow::bail!("this buddy has no snapshot of yours yet") };

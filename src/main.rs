@@ -6,7 +6,6 @@ mod bandwidth;
 mod activity;
 mod dashboard;
 mod dashboard_auth;
-mod manifest;
 mod netinfo;
 mod protocol;
 mod receive;
@@ -19,7 +18,6 @@ mod crypto;
 mod e2e_tests;
 mod excludes;
 mod index;
-mod names;
 mod restore;
 mod update_check;
 
@@ -29,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use age::secrecy::SecretString;
+use secrecy::SecretString;
 use anyhow::{Context, Result};
 use iroh::{
     endpoint::presets::Minimal, Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey,
@@ -50,7 +48,7 @@ struct Config {
     device_token: String,
     passphrase: SecretString,
     relay_url: RelayUrl,
-    // Config/state only: this device's identity key, per-buddy manifests,
+    // Config/state only: this device's identity key, per-buddy state,
     // and the usage/bandwidth ledgers — all small. Kept separate from the
     // two dirs below so a user's data drive never gets the client's own
     // files mixed into it, and config can live next to docker-compose.yml.
@@ -58,12 +56,11 @@ struct Config {
     // What buddies store with us: BUDDY_FILES_DIR/<their node id>/...
     // (encrypted, unreadable to us). Usually the big one — meant to point
     // at a dedicated folder on whatever drive has the space. Defaults to
-    // DATA_DIR/received, the pre-split layout, so an existing install that
-    // doesn't set it keeps working unchanged.
+    // DATA_DIR/received.
     buddy_files_dir: PathBuf,
     // Where restores from the dashboard (and the `restore` CLI's default)
     // land: RESTORE_DIR/<their node id>/... Never inside BACKUP_DIR, which
-    // is mounted read-only. Defaults to DATA_DIR/restored (pre-split).
+    // is mounted read-only. Defaults to DATA_DIR/restored.
     restore_dir: PathBuf,
     // RESTORE_DIR as the person knows it on their own machine, for the
     // dashboard's "Restored N file(s) to …" line — the container path
@@ -239,7 +236,6 @@ impl Config {
             ensure_writable_dir(name, dir).await?;
         }
 
-        self.check_pre_split_layout().await?;
         self.check_buddy_files_identity().await?;
         Ok(())
     }
@@ -254,8 +250,7 @@ impl Config {
     // match.
     //
     //   record   marker      →
-    //   none     none        first run (or an install from before this
-    //                        check): stamp the folder, keep the record
+    //   none     none        first run: stamp the folder, keep the record
     //   none     present     config was reset, folder kept: adopt its ID
     //   X        X           fine
     //   X        none        folder isn't the one we were using (unmounted
@@ -330,91 +325,6 @@ impl Config {
             }
         }
     }
-
-    // Before BUDDY_FILES_DIR / RESTORE_DIR existed, both lived inside
-    // DATA_DIR (as received/ and restored/). An existing install that picks
-    // up the new docker-compose.yml (e.g. via `install.sh --update`, which
-    // keeps .env) gets BUDDY_FILES_DIR pointed at a fresh, empty folder
-    // while its buddies' files are still in DATA_DIR/received. Starting on
-    // the empty folder would make those backups look missing (and
-    // usage.json would still count them against each pledge), so:
-    //   - new folder empty, old one has files -> keep using the old
-    //     location, and warn with how to move them;
-    //   - both have files -> refuse to start: we can't tell which is real;
-    //   - old one empty -> tidy it away so DATA_DIR holds config only.
-    // Files are never moved automatically: rename doesn't work across bind
-    // mounts (even on the same disk), and silently copying what could be
-    // terabytes at startup isn't something to do behind someone's back.
-    async fn check_pre_split_layout(&mut self) -> Result<()> {
-        let legacy_received = self.data_dir.join("received");
-        let received_moved = !same_dir(&legacy_received, &self.buddy_files_dir).await;
-        if received_moved && dir_has_entries(&legacy_received).await {
-            if dir_has_entries(&self.buddy_files_dir).await {
-                anyhow::bail!(
-                    "buddy files exist in both {} (the old location) and {} (BUDDY_FILES_DIR) — the client \
-                     won't start until there's only one. Stop the client and, on the host, move everything \
-                     from <DATA_DIR_HOST>/received/ into <BUDDY_FILES_DIR_HOST>/, merging any per-buddy folders.",
-                    legacy_received.display(),
-                    self.buddy_files_dir.display()
-                );
-            }
-            tracing::warn!(
-                using = %legacy_received.display(),
-                configured = %self.buddy_files_dir.display(),
-                "buddy files are still in the old location inside DATA_DIR, so the client is using them there for now. \
-                 To move them to their own folder: stop the client, then on the host move everything from \
-                 <DATA_DIR_HOST>/received/ into <BUDDY_FILES_DIR_HOST>/ (e.g. `mv data/received/* buddy-files/`), \
-                 and start it again"
-            );
-            let _ = tokio::fs::remove_dir(&self.buddy_files_dir).await; // only if empty; tidy the unused mount point
-            self.buddy_files_dir = legacy_received;
-            return self.check_legacy_restored().await;
-        }
-        // Empty leftover from the old layout — tidy it away so DATA_DIR
-        // holds config only. remove_dir only succeeds on an empty dir.
-        if received_moved {
-            // `mv data/received/* newfolder/` skips dotfiles, so the
-            // buddy-files marker (see check_buddy_files_identity) can be
-            // left behind. Carry it over — but only once the new folder
-            // actually has buddy files in it: if it's empty, it may be an
-            // unmounted drive, and stamping it would defeat that check.
-            let legacy_marker = legacy_received.join(BUDDY_FILES_MARKER);
-            let new_marker = self.buddy_files_dir.join(BUDDY_FILES_MARKER);
-            if tokio::fs::metadata(&legacy_marker).await.is_ok() {
-                if tokio::fs::metadata(&new_marker).await.is_err()
-                    && dir_has_entries(&self.buddy_files_dir).await
-                {
-                    tokio::fs::copy(&legacy_marker, &new_marker)
-                        .await
-                        .with_context(|| format!("can't write {}", new_marker.display()))?;
-                }
-                if tokio::fs::metadata(&new_marker).await.is_ok() {
-                    let _ = tokio::fs::remove_file(&legacy_marker).await;
-                }
-            }
-            let _ = tokio::fs::remove_dir(&legacy_received).await;
-        }
-
-        self.check_legacy_restored().await
-    }
-
-    // Old restores are the user's own output, not something the client
-    // depends on — just point at them rather than blocking startup.
-    async fn check_legacy_restored(&self) -> Result<()> {
-        let legacy_restored = self.data_dir.join("restored");
-        if !same_dir(&legacy_restored, &self.restore_dir).await {
-            if dir_has_entries(&legacy_restored).await {
-                tracing::warn!(
-                    old = %legacy_restored.display(),
-                    new = %self.restore_dir.display(),
-                    "files restored before RESTORE_DIR was set are still in the old location — new restores go to the new one; move or delete the old ones whenever convenient"
-                );
-            } else {
-                let _ = tokio::fs::remove_dir(&legacy_restored).await;
-            }
-        }
-        Ok(())
-    }
 }
 
 // Inside the container, RESTORE_DIR is just /restored — the host folder it's
@@ -471,35 +381,6 @@ async fn ensure_writable_dir(name: &str, dir: &Path) -> Result<()> {
         .with_context(|| format!("{name} ({}) isn't writable — check its bind mount in docker-compose.yml", dir.display()))?;
     let _ = tokio::fs::remove_file(&probe).await;
     Ok(())
-}
-
-// True if both paths are the same directory — compared by device + inode,
-// not by path, because the same host folder can show up at two different
-// paths inside the container (e.g. BUDDY_FILES_DIR_HOST pointed at the old
-// DATA_DIR_HOST/received, which is then visible both as /buddy-files and
-// as /data/received). Equal paths count as the same even if neither
-// exists yet.
-async fn same_dir(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    if a == b {
-        return true;
-    }
-    match (tokio::fs::metadata(a).await, tokio::fs::metadata(b).await) {
-        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
-        _ => false,
-    }
-}
-
-// Ignores the buddy-files marker, which on its own doesn't make a folder
-// "have buddy files" (see check_buddy_files_identity).
-async fn dir_has_entries(dir: &Path) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return false };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name() != BUDDY_FILES_MARKER {
-            return true;
-        }
-    }
-    false
 }
 
 #[derive(Deserialize)]
@@ -577,8 +458,8 @@ async fn main() -> Result<()> {
     // crypto.rs), so look that up first.
     let account_id = load_account_id(&http, &config).await?;
 
-    // Derive the file-encryption key from the passphrase (~1s, once) and
-    // open the on-disk index (importing old JSON manifests on first run).
+    // Derive the encryption key from the passphrase (~1s, once) and open
+    // the on-disk index (the Activity card).
     crypto::init(&config.passphrase, &account_id).context("failed to derive encryption key from BACKUP_PASSPHRASE")?;
     index::open(&config.data_dir).context("failed to open the index in DATA_DIR")?;
     activity::record(
@@ -588,32 +469,8 @@ async fn main() -> Result<()> {
         Vec::new(),
     );
     receive::clear_incoming(&config.buddy_files_dir).await;
-    backup::init_spool(&config.data_dir).await;
     chunked::init(&config.data_dir);
-    if !chunked::enabled() {
-        tracing::info!("CHUNKED_TRANSFERS is off: every buddy gets whole files");
-    }
     excludes::init(&config.data_dir).await;
-
-    // Remove buddies' backup copies (replaced or deleted content) once
-    // they're VERSION_RETENTION_DAYS old: now, then daily.
-    {
-        let buddy_files_dir = config.buddy_files_dir.clone();
-        tokio::spawn(async move {
-            loop {
-                let (files, bytes) = receive::expire_versions(&buddy_files_dir).await;
-                if files > 0 {
-                    tracing::info!(
-                        files,
-                        bytes,
-                        days = receive::VERSION_RETENTION_DAYS,
-                        "removed buddies' backup copies past the retention period"
-                    );
-                }
-                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
-            }
-        });
-    }
 
     let secret_key = load_or_generate_secret_key(&config.data_dir).await?;
     let endpoint_id = secret_key.public();
@@ -740,14 +597,10 @@ async fn main() -> Result<()> {
         tokio::fs::create_dir_all(&restore_dir).await?;
 
         tracing::info!(buddy = %buddy_id, dir = %restore_dir.display(), "starting restore");
-        let stats = restore::run_restore(
-            &endpoint,
-            &config.relay_url,
-            &config.passphrase,
-            buddy_id,
-            &restore_dir,
-        )
-        .await?;
+        let files = chunked_restore::list(&endpoint, &config.relay_url, buddy_id).await?.files;
+        let stats =
+            chunked_restore::restore_files(&endpoint, &config.relay_url, buddy_id, &restore_dir, &files, None)
+                .await?;
         tracing::info!(
             count = stats.files_restored,
             bytes = stats.bytes_restored,
@@ -799,12 +652,6 @@ async fn main() -> Result<()> {
     // dashboard reads this directly rather than probing anything itself.
     let cycle_stats: dashboard::CycleBook = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-    // Same idea, for reconciliation results (see
-    // backup::reconcile_with_buddy) — a separate book since it updates on
-    // its own, much less frequent cadence, not every ordinary cycle.
-    let reconcile_stats: dashboard::ReconcileBook =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-
     // Live progress of any backup cycle running right now, per buddy — so a
     // long first backup shows files/bytes done on the dashboard instead of
     // "no cycle yet" until the whole thing finishes.
@@ -843,13 +690,11 @@ async fn main() -> Result<()> {
         let pledge_book = pledge_book.clone();
         let bandwidth_book = bandwidth_book.clone();
         let cycle_stats = cycle_stats.clone();
-        let reconcile_stats = reconcile_stats.clone();
         let cycle_progress = cycle_progress.clone();
         let self_label = self_label.clone();
         let mdns_peers = mdns_peers.clone();
         let latest_version = latest_version.clone();
         let relay_url = config.relay_url.clone();
-        let passphrase = config.passphrase.clone();
         let stale_after_secs = config.stale_after_secs;
         tokio::spawn(async move {
             if let Err(err) = dashboard::run(
@@ -863,7 +708,6 @@ async fn main() -> Result<()> {
                 pledge_book,
                 bandwidth_book,
                 cycle_stats,
-                reconcile_stats,
                 cycle_progress,
                 self_label,
                 mdns_peers,
@@ -871,7 +715,6 @@ async fn main() -> Result<()> {
                 config.scan_interval_secs,
                 endpoint,
                 relay_url,
-                passphrase,
                 stale_after_secs,
             )
             .await
@@ -923,22 +766,9 @@ async fn main() -> Result<()> {
         let pledge_book = pledge_book.clone();
         let bandwidth_book = bandwidth_book.clone();
         let cycle_stats = cycle_stats.clone();
-        let reconcile_stats = reconcile_stats.clone();
         let cycle_progress = cycle_progress.clone();
         let self_label = self_label.clone();
         async move {
-            // When each buddy's manifest was last reconciled against what
-            // they actually report holding for us (see
-            // backup::reconcile_with_buddy) — separate from the ordinary
-            // ~30s cycle above, and deliberately much less frequent, since
-            // it costs the buddy a full file listing rather than only
-            // touching the network when something local changed. Declared
-            // here, outside the loop below, so it persists across ticks
-            // for the life of this process.
-            let mut last_reconcile: std::collections::HashMap<String, std::time::Instant> =
-                std::collections::HashMap::new();
-            const RECONCILE_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
-
             // Don't dial anyone until the relay connection is up (~3s
             // after start). A connection opened before then has the direct
             // LAN path as its only path; seen live, iroh then closes that
@@ -963,7 +793,7 @@ async fn main() -> Result<()> {
                         // see stripe-webhook.js) — per product decision,
                         // this stops ALL buddy syncing, not just relay
                         // traffic, so nothing here opens a connection,
-                        // sends a file, pings, or reconciles until the
+                        // backs up or pings until the
                         // account is active again. The dashboard banner
                         // (dashboard.html) and the payment-failed email
                         // are what the account holder actually sees; this
@@ -1130,18 +960,17 @@ async fn main() -> Result<()> {
                                                 .collect(),
                                             last_ok_at: None,
                                             consecutive_failures: 0,
-                                            // files_failed > 0 here means run_backup_cycle *did*
-                                            // open a connection and attempt to send (e.g. pledge
-                                            // enforcement rejected it) — reachability is already
-                                            // proven for this cycle, no extra ping needed. A
-                                            // permanently-stuck file (over pledge, too large,
-                                            // etc.) fails every single cycle forever by
-                                            // definition, so gating progress on files_failed == 0
-                                            // would make a perfectly healthy connection look
-                                            // "stale — last synced never" permanently. That
-                                            // specific-file problem is already called out loudly
-                                            // by the failed-files line and the "backup failed"
-                                            // pill right next to it — staleness doesn't need to
+                                            // files_failed > 0 here means files the scan couldn't
+                                            // read, while the snapshot of everything else went
+                                            // out (or nothing else changed) — reachability isn't
+                                            // in question. A permanently unreadable file fails
+                                            // every single cycle forever by definition, so gating
+                                            // progress on files_failed == 0 would make a
+                                            // perfectly healthy connection look "stale — last
+                                            // synced never" permanently. That specific-file
+                                            // problem is already called out loudly by the
+                                            // failed-files line and the "backup failed" pill
+                                            // right next to it — staleness doesn't need to
                                             // repeat it.
                                             made_progress: true,
                                             last_synced_at: None,
@@ -1229,76 +1058,6 @@ async fn main() -> Result<()> {
                                     record_backup_activity(&label, stats);
                                 }
                                 dashboard::record_cycle(&cycle_stats, node_id_str, record);
-
-                                // Periodic reconciliation — independent of
-                                // whether this particular cycle had anything
-                                // to send, since the whole point is to catch
-                                // drift that never shows up as a local file
-                                // change in the first place (see
-                                // backup::reconcile_with_buddy's doc comment).
-                                // Not for a chunked backup: it compares whole
-                                // files only ("0 files match"), and the buddy
-                                // already checks every repository file
-                                // against its content hash as it arrives.
-                                let reconcile_due = !chunked::has_repo(node_id_str)
-                                    && last_reconcile
-                                        .get(node_id_str)
-                                        .map(|at: &std::time::Instant| at.elapsed() >= RECONCILE_INTERVAL)
-                                        .unwrap_or(true);
-                                if reconcile_due {
-                                    last_reconcile
-                                        .insert(node_id_str.clone(), std::time::Instant::now());
-                                    let reconcile_result = backup::reconcile_with_buddy(
-                                        &endpoint,
-                                        &config.relay_url,
-                                        buddy_id,
-                                    )
-                                    .await;
-                                    let record = match &reconcile_result {
-                                        Ok(stats) => dashboard::ReconcileRecord {
-                                            at: dashboard::unix_now(),
-                                            checked: stats.checked,
-                                            missing_on_buddy: stats.missing_on_buddy.clone(),
-                                            unexpected_on_buddy: stats.unexpected_on_buddy.clone(),
-                                            error: None,
-                                        },
-                                        Err(err) => dashboard::ReconcileRecord {
-                                            at: dashboard::unix_now(),
-                                            checked: 0,
-                                            missing_on_buddy: Vec::new(),
-                                            unexpected_on_buddy: Vec::new(),
-                                            error: Some(err.to_string()),
-                                        },
-                                    };
-                                    reconcile_stats.lock().unwrap().insert(node_id_str.clone(), record);
-                                    match reconcile_result {
-                                        Ok(stats)
-                                            if stats.missing_on_buddy.is_empty()
-                                                && stats.unexpected_on_buddy.is_empty() =>
-                                        {
-                                            tracing::debug!(
-                                                buddy = %label,
-                                                checked = stats.checked,
-                                                "reconciliation: buddy's stored files match our manifest"
-                                            );
-                                        }
-                                        Ok(stats) => tracing::warn!(
-                                            buddy = %label,
-                                            checked = stats.checked,
-                                            missing_on_buddy = stats.missing_on_buddy.len(),
-                                            missing_paths = ?stats.missing_on_buddy,
-                                            unexpected_on_buddy = stats.unexpected_on_buddy.len(),
-                                            unexpected_paths = ?stats.unexpected_on_buddy,
-                                            "reconciliation found drift between our manifest and \
-                                             the buddy's actual files — missing ones will be \
-                                             re-sent automatically next cycle"
-                                        ),
-                                        Err(err) => tracing::warn!(
-                                            buddy = %label, ?err,
-                                            "reconciliation check against buddy's actual files failed"
-                                        ),
-                                    }
-                                }
                             } else {
                                 let result = ping(&endpoint, &config.relay_url, buddy_id).await;
                                 let record = dashboard::CycleRecord {
@@ -1354,29 +1113,18 @@ async fn main() -> Result<()> {
 }
 
 /// The Activity card's line for a backup cycle that did something: what
-/// was sent and removed, and files the buddy refused for the first time.
+/// was sent and removed.
 fn record_backup_activity(label: &str, stats: &backup::BackupCycleStats) {
     use activity::{fmt_bytes, kind, plural};
     if stats.files_sent > 0 || stats.files_deleted > 0 {
         let mut parts = Vec::new();
         if stats.files_sent > 0 {
             parts.push(format!("Sent {} ({})", plural(stats.files_sent, "file"), fmt_bytes(stats.bytes_sent)));
-            // Upgrading to 0.14.0 re-sends everything once (see names.rs):
-            // say so, or it reads like the whole backup changed.
-            if stats.names_hidden > 0 {
-                parts.push(format!(
-                    "{} of them already backed up, sent again to hide their names",
-                    stats.names_hidden
-                ));
-            }
         }
         if stats.files_deleted > 0 {
-            let why = match stats.newly_excluded {
-                0 => "deleted here".to_string(),
-                n if n >= stats.files_deleted => "now excluded".to_string(),
-                n => format!("{n} now excluded"),
-            };
-            let removed = format!("removed {} ({why})", plural(stats.files_deleted, "file"));
+            // Deleted here or now excluded: either way gone from the
+            // snapshot, and kept in older ones for 30 days.
+            let removed = format!("removed {}", plural(stats.files_deleted, "file"));
             parts.push(if parts.is_empty() { format!("R{}", &removed[1..]) } else { removed });
         }
         let mut text = parts.join(", ");
@@ -1398,17 +1146,6 @@ fn record_backup_activity(label: &str, stats: &backup::BackupCycleStats) {
             .chain(stats.deleted_paths.iter().map(|p| format!("removed  {p}")))
             .collect();
         activity::record(kind::BACKUP, Some(label), text, details);
-    }
-    // Grouped by reason: "refused 4 files: pledge full".
-    let mut by_reason: Vec<(&'static str, Vec<String>)> = Vec::new();
-    for (path, reason) in &stats.new_refusals {
-        match by_reason.iter_mut().find(|(r, _)| r == reason) {
-            Some((_, paths)) => paths.push(path.clone()),
-            None => by_reason.push((reason, vec![path.clone()])),
-        }
-    }
-    for (reason, paths) in by_reason {
-        activity::record(kind::PROBLEM, Some(label), format!("Refused {}: {reason}", plural(paths.len(), "file")), paths);
     }
 }
 

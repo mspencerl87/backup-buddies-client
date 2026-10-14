@@ -1,39 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Spencer LeBlanc
 
-//! The client's on-disk index (SQLite, `DATA_DIR/index.sqlite`).
+//! The client's on-disk index (SQLite, `DATA_DIR/index.sqlite`): the
+//! dashboard's Activity card (see activity.rs).
 //!
-//! Replaces the per-buddy `manifest-<buddy>.json` files, which were loaded
-//! whole into memory and rewritten in full after every file sent — fine for
-//! a few hundred files, hopeless for a million. Two tables:
-//!
-//! - `local_files`: size, modified time and SHA-256 of each file in
-//!   BACKUP_DIR, so a scan only re-reads a file when its size or modified
-//!   time changed. Shared by all buddies.
-//! - `sent`: per buddy, what we last sent them for each path (plaintext
-//!   size + hash, the encrypted size they store, and whether its name is
-//!   hidden — see names.rs) — the old manifest. Keyed by the real path.
-//! - `old_names`: per buddy, plaintext paths of files already re-sent
-//!   under encrypted names whose old copy still has to be deleted there.
-//! - `resends`: one row each time a file already on a buddy was sent
-//!   again because it changed, kept for RESEND_HISTORY_DAYS — for the
-//!   dashboard's "keeps re-sending" warning (any change re-sends the whole
-//!   file, so a big file that changes daily adds up fast).
-//! - `activity`: the dashboard's Activity card (see activity.rs).
-//!
-//! Existing JSON manifests are imported on first start and renamed to
-//! `*.json.migrated`, so nothing is re-sent after upgrading.
+//! It also held what whole-file backups had sent each buddy, until client
+//! 0.21.0 made chunked backups the only kind. Those tables are left as they
+//! are in an existing index, unused.
 
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
-
-/// How long re-send history is kept. Longer than the dashboard's window,
-/// which only looks at the last week.
-const RESEND_HISTORY_DAYS: i64 = 30;
+use rusqlite::{params, Connection};
 
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -54,44 +33,19 @@ pub struct ActivityEvent {
     pub details: Vec<String>,
 }
 
-/// One file's re-sends since some time, across all buddies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResendStat {
-    pub path: String,
-    pub sends: u64,
-    pub buddies: u64,
-    pub bytes: u64,
-    /// Its size on the latest re-send.
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SentEntry {
-    /// Plaintext size and hash of the local file when it was sent.
-    pub size: u64,
-    pub sha256: String,
-    /// Encrypted size stored on the buddy's side — what the dashboard shows
-    /// and reconciliation compares against the buddy's own listing.
-    pub ciphertext_size: u64,
-    /// How the buddy names it (names.rs): SCHEME_PLAIN for files sent
-    /// before 0.14.0, which are re-sent under encrypted names.
-    pub name_scheme: u8,
-}
-
 pub struct Index {
     conn: Mutex<Connection>,
 }
 
 static INDEX: OnceLock<Index> = OnceLock::new();
 
-/// Opens (creating if needed) the index in `data_dir` and imports any old
-/// JSON manifests. Call once at startup.
+/// Opens (creating if needed) the index in `data_dir`. Call once at
+/// startup.
 pub fn open(data_dir: &Path) -> Result<()> {
     if INDEX.get().is_some() {
         return Ok(());
     }
     let index = Index::open_at(&data_dir.join("index.sqlite"))?;
-    index.import_json_manifests(data_dir)?;
     let _ = INDEX.set(index);
     Ok(())
 }
@@ -109,177 +63,23 @@ pub fn try_get() -> Option<&'static Index> {
 impl Index {
     pub fn open_at(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("can't open {}", path.display()))?;
-        // WAL: readers (the dashboard) don't block the writer (backup
-        // cycles), and a crash mid-write can't corrupt the database.
+        // WAL: readers (the dashboard) don't block the writer, and a crash
+        // mid-write can't corrupt the database.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS local_files (
-                 path     TEXT PRIMARY KEY,
-                 size     INTEGER NOT NULL,
-                 mtime_ns INTEGER NOT NULL,
-                 sha256   TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS sent (
-                 buddy           TEXT NOT NULL,
-                 path            TEXT NOT NULL,
-                 size            INTEGER NOT NULL,
-                 sha256          TEXT NOT NULL,
-                 ciphertext_size INTEGER NOT NULL,
-                 PRIMARY KEY (buddy, path)
-             );
-             CREATE TABLE IF NOT EXISTS resends (
-                 buddy TEXT NOT NULL,
-                 path  TEXT NOT NULL,
-                 at    INTEGER NOT NULL,
-                 bytes INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS resends_at ON resends (at);
-             CREATE TABLE IF NOT EXISTS activity (
+            "CREATE TABLE IF NOT EXISTS activity (
                  id      INTEGER PRIMARY KEY AUTOINCREMENT,
                  at      INTEGER NOT NULL,
                  kind    TEXT NOT NULL,
                  buddy   TEXT,
                  text    TEXT NOT NULL,
                  details TEXT
-             );
-             CREATE TABLE IF NOT EXISTS old_names (
-                 buddy TEXT NOT NULL,
-                 path  TEXT NOT NULL,
-                 PRIMARY KEY (buddy, path)
              );",
         )
         .context("failed to set up the index")?;
-        // 0.14.0: which name scheme each sent file uses. Rows from before
-        // it are plaintext names (0).
-        let has_scheme = conn
-            .prepare("SELECT 1 FROM pragma_table_info('sent') WHERE name = 'name_scheme'")?
-            .exists([])?;
-        if !has_scheme {
-            conn.execute_batch("ALTER TABLE sent ADD COLUMN name_scheme INTEGER NOT NULL DEFAULT 0")
-                .context("failed to update the index")?;
-        }
         Ok(Self { conn: Mutex::new(conn) })
-    }
-
-    fn import_json_manifests(&self, data_dir: &Path) -> Result<()> {
-        let Ok(entries) = std::fs::read_dir(data_dir) else { return Ok(()) };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(buddy) = name.strip_prefix("manifest-").and_then(|n| n.strip_suffix(".json")) else {
-                continue;
-            };
-            let path = entry.path();
-            let manifest: crate::manifest::LegacyManifest = match std::fs::read(&path)
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-            {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(path = %path.display(), "old manifest unreadable — skipping import; that buddy's files will be re-checked");
-                    continue;
-                }
-            };
-            let count = manifest.entries.len();
-            {
-                let mut conn = self.conn.lock().unwrap();
-                let tx = conn.transaction()?;
-                {
-                    let mut stmt = tx.prepare(
-                        "INSERT OR REPLACE INTO sent (buddy, path, size, sha256, ciphertext_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )?;
-                    for (rel, e) in &manifest.entries {
-                        stmt.execute(params![buddy, rel, e.size as i64, e.sha256, e.ciphertext_size as i64])?;
-                    }
-                }
-                tx.commit()?;
-            }
-            let done = path.with_extension("json.migrated");
-            std::fs::rename(&path, &done).with_context(|| format!("can't rename {}", path.display()))?;
-            tracing::info!(buddy, files = count, "imported old manifest into the index");
-        }
-        Ok(())
-    }
-
-    // --- sent (what each buddy holds from us) ---------------------------
-
-    pub fn sent_entries(&self, buddy: &str) -> Result<HashMap<String, SentEntry>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT path, size, sha256, ciphertext_size, name_scheme FROM sent WHERE buddy = ?1")?;
-        let rows = stmt.query_map(params![buddy], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                SentEntry {
-                    size: r.get::<_, i64>(1)? as u64,
-                    sha256: r.get(2)?,
-                    ciphertext_size: r.get::<_, i64>(3)? as u64,
-                    name_scheme: r.get::<_, i64>(4)? as u8,
-                },
-            ))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// (file count, total encrypted bytes) we've sent this buddy.
-    pub fn sent_summary(&self, buddy: &str) -> Result<(usize, u64)> {
-        let conn = self.conn.lock().unwrap();
-        let (n, bytes): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(ciphertext_size), 0) FROM sent WHERE buddy = ?1",
-            params![buddy],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok((n as usize, bytes as u64))
-    }
-
-    pub fn record_sent(&self, buddy: &str, path: &str, e: &SentEntry) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached(
-            "INSERT OR REPLACE INTO sent (buddy, path, size, sha256, ciphertext_size, name_scheme) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?
-        .execute(params![buddy, path, e.size as i64, e.sha256, e.ciphertext_size as i64, e.name_scheme as i64])?;
-        Ok(())
-    }
-
-    /// Notes that `path`, already on `buddy`, was sent again because it
-    /// changed. Also drops history past RESEND_HISTORY_DAYS.
-    pub fn record_resend(&self, buddy: &str, path: &str, bytes: u64) -> Result<()> {
-        self.record_resend_at(buddy, path, bytes, now_secs())
-    }
-
-    fn record_resend_at(&self, buddy: &str, path: &str, bytes: u64, at: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached("INSERT INTO resends (buddy, path, at, bytes) VALUES (?1, ?2, ?3, ?4)")?
-            .execute(params![buddy, path, at, bytes as i64])?;
-        conn.prepare_cached("DELETE FROM resends WHERE at < ?1")?
-            .execute(params![at - RESEND_HISTORY_DAYS * 86_400])?;
-        Ok(())
-    }
-
-    /// Files re-sent at least `min_sends` times and `min_bytes` in total
-    /// over the last `days`, most bytes first.
-    pub fn frequent_resends(&self, days: i64, min_sends: u64, min_bytes: u64, limit: usize) -> Result<Vec<ResendStat>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT path, COUNT(*), COUNT(DISTINCT buddy), SUM(bytes),
-                    (SELECT r2.bytes FROM resends r2 WHERE r2.path = r.path ORDER BY r2.at DESC, r2.rowid DESC LIMIT 1)
-             FROM resends r WHERE at >= ?1
-             GROUP BY path HAVING COUNT(*) >= ?2 AND SUM(bytes) >= ?3
-             ORDER BY SUM(bytes) DESC LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(
-            params![now_secs() - days * 86_400, min_sends as i64, min_bytes as i64, limit as i64],
-            |row| {
-                Ok(ResendStat {
-                    path: row.get(0)?,
-                    sends: row.get::<_, i64>(1)? as u64,
-                    buddies: row.get::<_, i64>(2)? as u64,
-                    bytes: row.get::<_, i64>(3)? as u64,
-                    size: row.get::<_, i64>(4)? as u64,
-                })
-            },
-        )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Adds an Activity event, then trims to the last `keep_days` and at
@@ -342,165 +142,11 @@ impl Index {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-
-    /// Records that `path` is backed up on `buddy` under an encrypted name
-    /// now, so its plaintext-named copy (from before 0.14.0) can go:
-    /// replaces its `sent` row and queues the old copy for deletion in one
-    /// transaction, so a crash between the two can't orphan it.
-    pub fn record_name_hidden(&self, buddy: &str, path: &str, e: &SentEntry) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        tx.prepare_cached(
-            "INSERT OR REPLACE INTO sent (buddy, path, size, sha256, ciphertext_size, name_scheme) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?
-        .execute(params![buddy, path, e.size as i64, e.sha256, e.ciphertext_size as i64, e.name_scheme as i64])?;
-        tx.prepare_cached("INSERT OR IGNORE INTO old_names (buddy, path) VALUES (?1, ?2)")?
-            .execute(params![buddy, path])?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Plaintext-named copies still to delete on `buddy` (see
-    /// `record_name_hidden`).
-    pub fn old_names(&self, buddy: &str) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT path FROM old_names WHERE buddy = ?1 ORDER BY path")?;
-        let rows = stmt.query_map(params![buddy], |r| r.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
-    }
-
-    pub fn forget_old_name(&self, buddy: &str, path: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached("DELETE FROM old_names WHERE buddy = ?1 AND path = ?2")?.execute(params![buddy, path])?;
-        Ok(())
-    }
-
-    pub fn forget_sent(&self, buddy: &str, paths: &[String]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached("DELETE FROM sent WHERE buddy = ?1 AND path = ?2")?;
-            for p in paths {
-                stmt.execute(params![buddy, p])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    // --- local_files (hash cache for BACKUP_DIR) -------------------------
-
-    /// The stored hash for `path`, if its size and modified time still
-    /// match what was recorded — i.e. the file hasn't changed since.
-    pub fn cached_hash(&self, path: &str, size: u64, mtime_ns: i64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .prepare_cached("SELECT sha256 FROM local_files WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3")?
-            .query_row(params![path, size as i64, mtime_ns], |r| r.get(0))
-            .optional()?)
-    }
-
-    pub fn remember_hash(&self, path: &str, size: u64, mtime_ns: i64, sha256: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached(
-            "INSERT OR REPLACE INTO local_files (path, size, mtime_ns, sha256) VALUES (?1, ?2, ?3, ?4)",
-        )?
-        .execute(params![path, size as i64, mtime_ns, sha256])?;
-        Ok(())
-    }
-
-    /// Drops cached hashes for files no longer in BACKUP_DIR. Only call
-    /// after a complete scan (nothing unreadable), or files that merely
-    /// couldn't be read this time would lose their entry.
-    pub fn prune_hashes(&self, present: &HashSet<&String>) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let gone: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT path FROM local_files")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.filter_map(|r| r.ok()).filter(|p| !present.contains(p)).collect()
-        };
-        if gone.is_empty() {
-            return Ok(());
-        }
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached("DELETE FROM local_files WHERE path = ?1")?;
-            for p in &gone {
-                stmt.execute(params![p])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn imports_old_json_manifest_once_and_tracks_changes() {
-        let dir = std::env::temp_dir().join(format!("bb-index-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("manifest-buddyA.json"),
-            r#"{"entries":{"a.txt":{"size":5,"sha256":"aa","ciphertext_size":200},
-                           "old.txt":{"size":1,"sha256":"bb"}}}"#,
-        )
-        .unwrap();
-
-        let idx = Index::open_at(&dir.join("index.sqlite")).unwrap();
-        idx.import_json_manifests(&dir).unwrap();
-        assert!(dir.join("manifest-buddyA.json.migrated").exists());
-        let sent = idx.sent_entries("buddyA").unwrap();
-        assert_eq!(sent["a.txt"], SentEntry { size: 5, sha256: "aa".into(), ciphertext_size: 200, name_scheme: 0 }, "imported rows have plaintext names");
-        assert_eq!(sent["old.txt"].ciphertext_size, 0, "missing field defaults like before");
-        assert_eq!(idx.sent_summary("buddyA").unwrap(), (2, 200));
-        assert!(idx.sent_entries("buddyB").unwrap().is_empty());
-
-        // Second import is a no-op (file already renamed).
-        idx.import_json_manifests(&dir).unwrap();
-        assert_eq!(idx.sent_summary("buddyA").unwrap().0, 2);
-
-        idx.forget_sent("buddyA", &["old.txt".to_string()]).unwrap();
-        idx.record_sent("buddyA", "b.txt", &SentEntry { size: 9, sha256: "cc".into(), ciphertext_size: 300, name_scheme: 1 }).unwrap();
-        assert_eq!(idx.sent_entries("buddyA").unwrap()["b.txt"].name_scheme, 1);
-        assert_eq!(idx.sent_summary("buddyA").unwrap(), (2, 500));
-
-        // Hash cache only hits when size and mtime both still match.
-        idx.remember_hash("a.txt", 5, 111, "aa").unwrap();
-        assert_eq!(idx.cached_hash("a.txt", 5, 111).unwrap().as_deref(), Some("aa"));
-        assert_eq!(idx.cached_hash("a.txt", 5, 112).unwrap(), None);
-        assert_eq!(idx.cached_hash("a.txt", 6, 111).unwrap(), None);
-        let keep = "b.txt".to_string();
-        idx.prune_hashes(&[&keep].into_iter().collect()).unwrap();
-        assert_eq!(idx.cached_hash("a.txt", 5, 111).unwrap(), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_index_from_before_0_14_gets_name_schemes() {
-        let dir = std::env::temp_dir().join(format!("bb-index-scheme-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("index.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE sent (buddy TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
-                     sha256 TEXT NOT NULL, ciphertext_size INTEGER NOT NULL, PRIMARY KEY (buddy, path));
-                 INSERT INTO sent VALUES ('buddyA', 'Photos/a.jpg', 5, 'aa', 200);",
-            )
-            .unwrap();
-        }
-        let idx = Index::open_at(&path).unwrap();
-        assert_eq!(idx.sent_entries("buddyA").unwrap()["Photos/a.jpg"].name_scheme, 0, "sent with its real name");
-        drop(idx);
-        // Opening again doesn't try to add the column twice.
-        Index::open_at(&path).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn activity_is_newest_first_filtered_and_trimmed() {
@@ -521,40 +167,6 @@ mod tests {
         let problems = idx.recent_activity(&["problem"], 50).unwrap();
         assert!(problems.iter().all(|e| e.kind == "problem") && problems.len() == 2);
         assert_eq!(idx.recent_activity(&[], 2).unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn frequent_resends_add_up_per_file() {
-        let dir = std::env::temp_dir().join(format!("bb-index-resends-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let idx = Index::open_at(&dir.join("index.sqlite")).unwrap();
-        let gb = 1u64 << 30;
-        let now = now_secs();
-        for day in 0..4 {
-            idx.record_resend_at("buddyA", "vm/disk.qcow2", 20 * gb, now - day * 86_400).unwrap();
-        }
-        idx.record_resend_at("buddyB", "vm/disk.qcow2", 21 * gb, now).unwrap();
-        // Too long ago for the week's window.
-        idx.record_resend_at("buddyA", "vm/disk.qcow2", 20 * gb, now - 10 * 86_400).unwrap();
-        // Changes often, but small.
-        for _ in 0..10 {
-            idx.record_resend_at("buddyA", "notes.txt", 2_000, now).unwrap();
-        }
-        // Big, but only once.
-        idx.record_resend_at("buddyA", "video.mkv", 8 * gb, now).unwrap();
-
-        let stats = idx.frequent_resends(7, 3, gb, 10).unwrap();
-        assert_eq!(
-            stats,
-            vec![ResendStat { path: "vm/disk.qcow2".into(), sends: 5, buddies: 2, bytes: 101 * gb, size: 21 * gb }]
-        );
-
-        // History past RESEND_HISTORY_DAYS is dropped on the next insert.
-        idx.record_resend_at("buddyA", "old.bin", 1, now - 40 * 86_400).unwrap();
-        idx.record_resend_at("buddyA", "new.bin", 1, now).unwrap();
-        assert!(idx.frequent_resends(60, 1, 0, 10).unwrap().iter().all(|s| s.path != "old.bin"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

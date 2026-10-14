@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Spencer LeBlanc
 
-//! Chunked backups, the buddy's side and the wire calls (protocol v5).
+//! Backup repositories, the buddy's side and the wire calls (protocol v5).
 //!
-//! Whole-file backups re-send a file in full whenever it changes, and a
-//! rename or a move looks like a delete plus a new file: renaming four ISOs
-//! on a test device re-sent ~15 GB. With chunked backups the sender keeps a
-//! restic-format repository (built with rustic_core): files are split into
-//! content-defined chunks, encrypted, deduplicated and packed into ~32 MB
-//! pack files, so a rename costs nothing and an edit costs only the chunks
-//! it touched. The buddy stores that repository under
+//! The sender keeps a restic-format repository (built with rustic_core,
+//! see chunked.rs): files are split into content-defined chunks,
+//! encrypted, deduplicated and packed into ~32 MB pack files, so a rename
+//! costs nothing and an edit costs only the chunks it touched. The buddy
+//! stores that repository under
 //! `<buddy-files>/<sender>/.repo/` as opaque encrypted files, by kind and
 //! id, and never sees file names, counts, sizes or folders at all.
 //!
@@ -29,8 +27,7 @@ use crate::protocol::{
 };
 use crate::receive::{self, PledgeBook};
 
-/// Where a sender's repository lives inside their folder. Hidden from the
-/// whole-file listings (receive.rs's collect_files), like `.versions/`.
+/// Where a sender's repository lives inside their folder.
 pub(crate) const REPO_DIR: &str = ".repo";
 
 /// rustic_core states file sizes as u32, so no repository file is bigger.
@@ -174,6 +171,11 @@ pub(crate) async fn handle_read(
     }
     send.finish().context("failed to finish send stream")?;
     crate::bandwidth::record(data_dir, bandwidth_book, quality, len).await;
+    if kind == RepoFileKind::Pack
+        && let Some(remote) = sender_dir.file_name().and_then(|n| n.to_str())
+    {
+        crate::activity::incoming_fetched(remote, len);
+    }
     Ok(())
 }
 
@@ -198,10 +200,10 @@ pub(crate) async fn handle_write(
     if len > MAX_REPO_FILE_BYTES {
         return receive::reject_without_reading_body(recv, send, PutRejectReason::TooLarge).await;
     }
-    // The same size, disk-floor and pledge checks as a whole-file upload,
-    // which also reserve the space (handed back below if this fails).
+    // The disk-floor and pledge checks, which also reserve the space
+    // (handed back below if this fails).
     let admitted =
-        match receive::admit_put(sender_dir, remote_id, pledge_book, buddy_files_dir, &rel, len, 0).await {
+        match receive::admit_put(sender_dir, remote_id, pledge_book, buddy_files_dir, &rel, len).await {
             Ok(a) => a,
             Err(reason) => return receive::reject_without_reading_body(recv, send, reason).await,
         };
@@ -230,10 +232,10 @@ pub(crate) async fn handle_write(
         return protocol::write_frame(send, &SyncAck::err("hash mismatch")).await;
     }
 
-    // No backup copies here, unlike whole files: the repository keeps its
-    // own history (snapshots), and a rewrite of the same id is the same
-    // bytes, except for `config`, which the sender only writes when it
-    // creates the repository.
+    // No backup copies here: the repository keeps its own history
+    // (snapshots), and a rewrite of the same id is the same bytes, except
+    // for `config`, which the sender only writes when it creates the
+    // repository.
     let stored = async {
         if let Some(parent) = admitted.dest.parent() {
             tokio::fs::create_dir_all(parent).await.context("failed to create repository folder")?;
@@ -251,6 +253,9 @@ pub(crate) async fn handle_write(
         tracing::warn!(?err, "failed to persist usage ledger");
     }
     crate::bandwidth::record(data_dir, bandwidth_book, quality, len).await;
+    if kind == RepoFileKind::Pack {
+        crate::activity::incoming_stored(remote_id, len);
+    }
     protocol::write_frame(send, &SyncAck::ok()).await?;
     tracing::debug!(from = %remote_id, ?kind, %id, bytes = len, "stored repository file from buddy");
     Ok(())
@@ -274,6 +279,9 @@ pub(crate) async fn handle_remove(
         // Idempotent: already gone is fine (a prune retried after a drop).
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return protocol::write_frame(send, &SyncAck::err(format!("failed to remove: {err}"))).await,
+    }
+    if freed > 0 && kind == RepoFileKind::Pack {
+        crate::activity::incoming_removed(remote_id, freed);
     }
     if freed > 0 {
         {
@@ -331,8 +339,8 @@ pub(crate) async fn read(
     Ok(data)
 }
 
-/// Stores a repository file. A refusal (pledge or disk full) fails with the
-/// same STOP_SENDING reason a whole-file upload gets.
+/// Stores a repository file. A refusal (pledge or disk full) fails with a
+/// STOP_SENDING reason (protocol::PutRejectReason).
 pub(crate) async fn write(conn: &iroh::endpoint::Connection, kind: RepoFileKind, id: &str, data: &[u8]) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.context("failed to open stream")?;
     protocol::write_frame(&mut send, &SyncRequest::RepoWrite { kind, id: id.to_string(), len: data.len() as u64 })

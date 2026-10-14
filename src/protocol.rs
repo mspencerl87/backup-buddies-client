@@ -10,34 +10,22 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 // which would break every pairing where one buddy updated first.
 pub const ALPN: &[u8] = b"backup-buddies/sync/1";
 
-/// This client's protocol version, reported in HelloResponse.
-/// 2 (client 0.5.0): PutStream.
-/// 3 (client 0.8.0): PutResumable.
-/// 4 (client 0.9.0): PurgeDeleted.
-/// 5 (client 0.16.0): RepoList/RepoRead/RepoWrite/RepoRemove, a buddy
-/// storing a chunked backup repository (see repo.rs).
+/// This client's protocol version, reported in HelloResponse. 5 (client
+/// 0.16.0) added the Repo* requests, a buddy storing a chunked backup
+/// repository (see repo.rs); since client 0.21.0 that's the only kind of
+/// backup, and the whole-file requests of versions 1–4 are gone.
 pub const PROTOCOL_VERSION: u32 = 5;
-
-/// Largest file sent to a buddy whose client predates PutStream: the old
-/// Put needs the whole file's hash before sending, so the encrypted file is
-/// held in memory first. Bigger files wait until the buddy updates.
-pub const LEGACY_PUT_MAX_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Largest single file accepted. Files stream in bounded memory now, so
-/// this is only a sanity bound; pledges and the real-disk floor are what
-/// actually limit how much a buddy can store.
-pub const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 
 pub fn explain_connect_error(err: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("failed to connect to buddy: {err}")
 }
 
 // Every exchange on a stream starts with one framed SyncRequest, answered
-// with one framed SyncAck (Ping/Put/Delete), a ListResponse (List), or a
-// SyncAck followed by raw bytes (Get). Framing is a 4-byte little-endian
-// length prefix followed by that many bytes of JSON — simple, and keeps
-// control messages clearly separated from the raw file bytes that follow
-// some of them on the same stream.
+// with a framed reply (see each request), followed by raw bytes for
+// RepoRead. Framing is a 4-byte little-endian length prefix followed by
+// that many bytes of JSON — simple, and keeps control messages clearly
+// separated from the raw file bytes that follow some of them on the same
+// stream.
 const MAX_FRAME_BYTES: usize = 1024 * 1024; // control messages are tiny; generous headroom
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,50 +34,10 @@ pub enum SyncRequest {
     /// No backup work to do this cycle — just prove the connection still
     /// works. Same purpose the old test-payload protocol served.
     Ping,
-    /// "Here's a new/changed file." Followed immediately on the stream by
-    /// exactly `ciphertext_len` raw bytes — not framed, since the header
-    /// already states the length.
-    Put {
-        path: String,
-        ciphertext_len: u64,
-        ciphertext_sha256: String,
-    },
-    /// Protocol v2's upload: like Put, but the SHA-256 isn't known until
-    /// the file has been encrypted and sent, so it follows the
-    /// `ciphertext_len` raw bytes as a framed `PutTrailer`.
-    PutStream { path: String, ciphertext_len: u64 },
-    /// Protocol v3's upload for big files: like PutStream, but an upload
-    /// cut off partway can carry on where it stopped. The receiver keeps
-    /// the partial bytes under `upload_id` and answers with a
-    /// PutResumeReply saying how many it already has; the sender then sends
-    /// only the rest, followed by a PutTrailer for the *whole* file, and
-    /// gets a SyncAck. Resuming only works because the sender kept the
-    /// exact ciphertext it started with (age encrypts with a fresh random
-    /// key each time, so re-encrypting would give different bytes) — a new
-    /// encryption always gets a new `upload_id`.
-    PutResumable { path: String, upload_id: String, ciphertext_len: u64 },
-    /// Protocol v2's List: the same file list, sent as a series of
-    /// ListChunk frames (LIST_CHUNK_ENTRIES each, last one `done: true`)
-    /// instead of one frame — a single frame caps out around 10,000 files
-    /// (MAX_FRAME_BYTES). Older clients don't know it and drop the stream;
-    /// the caller then falls back to List.
-    ListStream,
     /// "Which protocol version do you speak?" Answered with HelloResponse.
-    /// A client older than 0.5.0 can't parse this and drops the stream —
-    /// which is itself the answer: version 1.
+    /// A client older than 0.5.0 can't parse this and drops the stream,
+    /// which reads as version 1.
     Hello,
-    /// "Forget this file" — frees up the sender's pledge usage with us.
-    /// Idempotent: deleting something already gone is not an error.
-    Delete { path: String },
-    /// "What do you have backed up for me?" Answered with ListResponse.
-    /// Scoped to the connecting peer's own authenticated node id — a
-    /// buddy can only ever list/fetch what *they themselves* stored with
-    /// us, never another buddy's data (see receive.rs).
-    List,
-    /// "Send me this one file's ciphertext back." Answered with a
-    /// SyncAck (ok:false if not found), or on success a SyncAck{ok:true}
-    /// immediately followed by the raw ciphertext bytes.
-    Get { path: String },
     /// "What does your disk actually look like?" — real filesystem space
     /// plus how much of it you've committed across every buddy, not just
     /// what you've pledged me. Answered with DiskStatsResponse. Lets each
@@ -97,19 +45,6 @@ pub enum SyncRequest {
     /// trusting the pledge they agreed to, so an over-pledged or
     /// nearly-full buddy is visible before it becomes a failed backup.
     DiskStats,
-    /// "What old copies of this file do you still have?" — every time a
-    /// path is overwritten or deleted, the previous content is kept as a
-    /// numbered backup rather than discarded (see receive.rs's
-    /// rotate_versions). Answered with ListVersionsResponse.
-    ListVersions { path: String },
-    /// "Send me backup slot N of this file." Same response shape as Get:
-    /// a SyncAck, then on success the raw ciphertext bytes.
-    GetVersion { path: String, version: u32 },
-    /// "Remove the backup copies of this file I deleted, for good" — the
-    /// dashboard's "Delete permanently". Answered with a SyncAck. Refused
-    /// while a live file still exists at `path`, so it can only ever take
-    /// away copies of something the sender already deleted.
-    PurgeDeleted { path: String },
     /// Protocol v5: "Which repository files of this kind do you hold for
     /// me?" Answered with RepoListChunk frames (REPO_LIST_CHUNK_ENTRIES
     /// each, last one `done: true`). The repository is a restic-format one
@@ -121,11 +56,11 @@ pub enum SyncRequest {
     /// with a RepoReadReply, then on success exactly that many raw bytes.
     RepoRead { kind: RepoFileKind, id: String, offset: u64, length: Option<u64> },
     /// Protocol v5: "Store this repository file." Followed by exactly `len`
-    /// raw bytes; answered with a SyncAck, or refused before the body like
-    /// a Put (STOP_SENDING with a PutRejectReason code).
+    /// raw bytes; answered with a SyncAck, or refused before the body
+    /// (STOP_SENDING with a PutRejectReason code).
     RepoWrite { kind: RepoFileKind, id: String, len: u64 },
     /// Protocol v5: "Remove this repository file." Answered with a SyncAck.
-    /// Idempotent, like Delete.
+    /// Idempotent: removing something already gone is not an error.
     RepoRemove { kind: RepoFileKind, id: String },
 }
 
@@ -166,7 +101,7 @@ pub struct RepoReadReply {
     pub error: Option<String>,
 }
 
-/// Why a Put was rejected *before* its body was ever read (see
+/// Why a RepoWrite was rejected *before* its body was ever read (see
 /// receive.rs's `reject_without_reading_body`). Encoded as the QUIC
 /// STOP_SENDING error code, not just the SyncAck's string `error` field —
 /// a sender that's still mid-`write_all` when the rejection happens never
@@ -215,44 +150,16 @@ impl PutRejectReason {
     pub fn message(self) -> &'static str {
         match self {
             Self::PledgeExceeded => "your buddy's pledge to you is full",
-            Self::TooLarge => "file is larger than the 1 TB per-file limit",
+            Self::TooLarge => "your buddy refused a piece of the backup as too large",
             Self::InvalidPath => "file path was rejected as invalid",
             Self::DiskFull => "your buddy doesn't have enough real disk space left",
         }
     }
 }
 
-pub const LIST_CHUNK_ENTRIES: usize = 5000;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListChunk {
-    pub files: Vec<ListEntry>,
-    pub done: bool,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub protocol_version: u32,
-}
-
-/// The receiver's answer to PutResumable, before any file bytes: `offset`
-/// is how many bytes of this upload it already holds (0 for a new one).
-/// On a refusal `offset` is None and `reject_code` is the PutRejectReason
-/// code, also sent as STOP_SENDING like any other refusal.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct PutResumeReply {
-    #[serde(default)]
-    pub offset: Option<u64>,
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub reject_code: Option<u64>,
-}
-
-/// Sent after a PutStream's bytes.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PutTrailer {
-    pub ciphertext_sha256: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,26 +178,6 @@ impl SyncAck {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListEntry {
-    pub path: String,
-    pub size: u64,
-    /// True when this path has no live file anymore — it was deleted, and
-    /// what's left is only a backup slot under `.versions/` (see
-    /// `rotate_versions` in receive.rs). `size` for a deleted entry is the
-    /// size of its newest surviving version, not a live file. Lets the
-    /// dashboard's file browser still show (and offer History/restore-a-
-    /// version for) a file the person deleted, instead of it silently
-    /// disappearing from the list the moment there's no live copy.
-    #[serde(default)]
-    pub deleted: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListResponse {
-    pub files: Vec<ListEntry>,
-}
-
 /// Answer to `SyncRequest::DiskStats` — the responder's real, physical
 /// filesystem numbers (not a promise): what's actually on disk under its
 /// DATA_DIR, plus the sum of what it's pledged out across every buddy it
@@ -304,29 +191,6 @@ pub struct DiskStatsResponse {
     pub available_bytes: u64,
     pub used_bytes: u64,
     pub pledged_out_total_bytes: u64,
-}
-
-/// One backed-up previous copy of a file. `version: 1` is the most
-/// recently replaced/deleted content, counting up to however many backup
-/// slots this host keeps (see receive.rs::MAX_BACKUP_VERSIONS) — the
-/// live/current copy (if it still exists) is not included here, it's what
-/// List/Get already report.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VersionEntry {
-    pub version: u32,
-    pub size: u64,
-    /// When this became a backup copy (client 0.8.2+; before that, when it
-    /// was uploaded).
-    pub modified_unix: Option<u64>,
-    /// When the buddy will remove it for good (VERSION_RETENTION_DAYS).
-    /// None from buddies older than 0.8.2, which keep copies forever.
-    #[serde(default)]
-    pub expires_unix: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListVersionsResponse {
-    pub versions: Vec<VersionEntry>,
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut iroh::endpoint::SendStream, value: &T) -> Result<()> {

@@ -9,7 +9,6 @@ use std::{
     time::Instant,
 };
 
-use age::secrecy::SecretString;
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, StatusCode},
@@ -92,10 +91,9 @@ pub struct CycleRecord {
     pub last_synced_at: Option<u64>,
 }
 
-/// One failed path plus why, when we know why — see
-/// backup::reject_reason_from_err for how `reason` gets populated. Its own
-/// type (rather than reusing backup::FailedFile directly) so this module
-/// controls the wire shape independent of backup.rs's internals.
+/// One failed path plus why, when we know why. Its own type (rather than
+/// reusing backup::FailedFile directly) so this module controls the wire
+/// shape independent of backup.rs's internals.
 #[derive(Clone, Serialize)]
 pub struct FailedFileView {
     pub path: String,
@@ -138,31 +136,10 @@ pub fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// One buddy's most recent reconciliation result — see
-/// backup::reconcile_with_buddy for what this actually checks (the
-/// manifest vs. the buddy's real stored files, not just our local diff).
-/// Updated by main.rs's outbound loop every time it runs a reconciliation
-/// pass (roughly every 10 minutes per buddy, not every ordinary cycle).
-#[derive(Clone, Serialize)]
-pub struct ReconcileRecord {
-    pub at: u64,
-    pub checked: usize,
-    pub missing_on_buddy: Vec<String>,
-    pub unexpected_on_buddy: Vec<String>,
-    // Set when the reconciliation attempt itself failed (couldn't connect,
-    // couldn't list) rather than succeeding and finding drift — a
-    // different situation from "checked and it's clean" or "checked and
-    // found a mismatch", so the dashboard can tell them apart instead of
-    // an error silently looking identical to "never checked".
-    pub error: Option<String>,
-}
-
-pub type ReconcileBook = Arc<Mutex<HashMap<String, ReconcileRecord>>>;
-
 #[derive(Clone)]
 struct AppState {
     node_id: String,
-    // Config/state only (identity key, manifests, ledgers).
+    // Config/state only (identity key, backup state, ledgers).
     data_dir: PathBuf,
     // What buddies store with us — BUDDY_FILES_DIR/<their node id>/.
     buddy_files_dir: PathBuf,
@@ -175,7 +152,6 @@ struct AppState {
     pledge_book: PledgeBook,
     bandwidth_book: BandwidthBook,
     cycle_stats: CycleBook,
-    reconcile_stats: ReconcileBook,
     // Live progress of any backup cycle running right now — see
     // backup::CycleProgress.
     cycle_progress: crate::backup::CycleProgressBook,
@@ -196,7 +172,6 @@ struct AppState {
     cycle_interval_secs: u64,
     endpoint: Endpoint,
     relay_url: RelayUrl,
-    passphrase: SecretString,
     stale_after_secs: u64,
     restore_progress: RestoreProgressBook,
     // Set once, when the dashboard starts serving — i.e. process start for
@@ -221,14 +196,11 @@ struct BuddyStatus {
     // their files (see receive.rs's pledge enforcement).
     pledged_bytes: u64,
     received_bytes_counted: u64,
-    received_files: usize,
-    received_total_bytes: u64,
-    // What *we've* sent *them*, per our own manifest for that buddy, or
-    // for a chunked backup, what its last snapshot holds.
+    // What *we've* sent *them*: what our last snapshot on their side holds
+    // (0 before the first).
     sent_files: usize,
     sent_bytes: u64,
-    sent_chunked: bool,
-    // Size of the chunked backup they keep with us (0 if none).
+    // Size of the backup they keep with us (0 if none).
     received_repo_bytes: u64,
     // Set when this isn't one of our buddies' devices any more: when what
     // it keeps here is removed (receive::sweep_orphans).
@@ -242,10 +214,6 @@ struct BuddyStatus {
     // computed here rather than left to the frontend so the threshold
     // lives in one place (Config::stale_after_secs).
     stale: bool,
-    // Most recent reconciliation result (see backup::reconcile_with_buddy)
-    // — absent until the first one has actually run, roughly 10 minutes
-    // after this buddy pairing starts sending files.
-    last_reconcile: Option<ReconcileRecord>,
 }
 
 /// Physical space on the filesystem backing `buddy_files_dir` — where every
@@ -263,7 +231,7 @@ struct DiskStatus {
 }
 
 /// What's actually sitting in `backup_dir` right now, independent of
-/// what's made it into any buddy's manifest yet — a plain re-scan (see
+/// what's made it into any buddy's backup yet — a plain re-scan (see
 /// backup::local_backup_summary), not a sync-protocol number.
 #[derive(Serialize)]
 struct LocalBackupStatus {
@@ -272,25 +240,6 @@ struct LocalBackupStatus {
     // Files and skipped folders the exclude list kept out (see excludes.rs).
     excluded_count: usize,
 }
-
-/// A big file that keeps re-sending (see index::frequent_resends): every
-/// change sends the whole file again, to every buddy.
-#[derive(Serialize)]
-struct ResendStatus {
-    path: String,
-    sends: u64,
-    buddies: u64,
-    bytes: u64,
-    size: u64,
-}
-
-// What counts as "keeps re-sending" on the dashboard: at least this many
-// re-sends adding up to at least this much over the last RESEND_DAYS.
-// Roughly a 1 GB file changing every other day, or anything bigger more
-// often; small files that change a lot don't cost enough to mention.
-const RESEND_DAYS: i64 = 7;
-const RESEND_MIN_SENDS: u64 = 3;
-const RESEND_MIN_BYTES: u64 = 1 << 30;
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -326,8 +275,6 @@ struct StatusResponse {
     mdns_peers_visible: usize,
     cycle_interval_secs: u64,
     local_backup: Option<LocalBackupStatus>,
-    // Big files re-sent often this week, already excluded ones left out.
-    resending: Vec<ResendStatus>,
     disk: Option<DiskStatus>,
     // Sum of every buddy's pledged_bytes — the total we've promised to
     // store for others on this same disk. Compared against `disk` on the
@@ -380,7 +327,8 @@ struct PathQuery {
 }
 
 /// Request body for POST /api/restore-version/:node_id — restores one
-/// specific backup slot of one file, rather than the live copy.
+/// earlier version of one file (as numbered by History), rather than the
+/// latest.
 #[derive(Deserialize)]
 struct RestoreVersionRequest {
     path: String,
@@ -390,8 +338,8 @@ struct RestoreVersionRequest {
 /// Binds and serves the dashboard until the process shuts down. Meant to
 /// run alongside the accept/outbound loops in main.rs's tokio::select!,
 /// not instead of them — it only reads the same state those loops already
-/// maintain (pledge_book, cycle_stats) plus whatever's on disk (manifests,
-/// received/), it never competes with them for the sync protocol itself.
+/// maintain (pledge_book, cycle_stats) plus whatever's on disk, it never
+/// competes with them for the sync protocol itself.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     bind_addr: &str,
@@ -404,7 +352,6 @@ pub async fn run(
     pledge_book: PledgeBook,
     bandwidth_book: BandwidthBook,
     cycle_stats: CycleBook,
-    reconcile_stats: ReconcileBook,
     cycle_progress: crate::backup::CycleProgressBook,
     self_label: Arc<Mutex<Option<String>>>,
     mdns_peers: Arc<Mutex<HashSet<EndpointId>>>,
@@ -412,7 +359,6 @@ pub async fn run(
     cycle_interval_secs: u64,
     endpoint: Endpoint,
     relay_url: RelayUrl,
-    passphrase: SecretString,
     stale_after_secs: u64,
 ) -> anyhow::Result<()> {
     let auth = Auth::new(&data_dir, bind_addr);
@@ -426,7 +372,6 @@ pub async fn run(
         pledge_book,
         bandwidth_book,
         cycle_stats,
-        reconcile_stats,
         cycle_progress,
         self_label,
         mdns_peers,
@@ -434,7 +379,6 @@ pub async fn run(
         cycle_interval_secs,
         endpoint,
         relay_url,
-        passphrase,
         stale_after_secs,
         restore_progress: Arc::new(Mutex::new(HashMap::new())),
         started_at: Instant::now(),
@@ -452,9 +396,7 @@ pub async fn run(
         .route("/api/restore/:node_id", post(restore_handler))
         .route("/api/buddies/:node_id/restore-progress", get(restore_progress_handler))
         .route("/api/restore-version/:node_id", post(restore_version_handler))
-        .route("/api/buddies/:node_id/purge", post(purge_handler))
         .route("/api/excludes", get(excludes_get_handler).post(excludes_save_handler))
-        .route("/api/excludes/add", post(exclude_one_handler))
         .route("/api/activity", get(activity_handler))
         .route("/api/logs", get(logs_handler))
         .with_state(state)
@@ -472,33 +414,6 @@ pub async fn run(
     // Connect info: the login rate limit needs the caller's address.
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
-}
-
-async fn resending_files(backup_dir: &std::path::Path) -> Vec<ResendStatus> {
-    let stats = match crate::index::get().frequent_resends(RESEND_DAYS, RESEND_MIN_SENDS, RESEND_MIN_BYTES, 20) {
-        Ok(stats) => stats,
-        Err(err) => {
-            tracing::warn!(?err, "can't read re-send history");
-            return Vec::new();
-        }
-    };
-    // History stays for a week after a file is excluded, deleted or moved;
-    // either way it's dealt with.
-    let rules = crate::excludes::Rules::load().ok();
-    let mut out = Vec::new();
-    for s in stats {
-        if rules.as_ref().is_some_and(|r| r.is_excluded(&s.path)) {
-            continue;
-        }
-        if !tokio::fs::try_exists(backup_dir.join(&s.path)).await.unwrap_or(true) {
-            continue;
-        }
-        out.push(ResendStatus { path: s.path, sends: s.sends, buddies: s.buddies, bytes: s.bytes, size: s.size });
-        if out.len() == 5 {
-            break;
-        }
-    }
-    out
 }
 
 #[derive(Deserialize)]
@@ -524,19 +439,6 @@ async fn activity_handler(Query(q): Query<ActivityQuery>) -> Result<Json<Vec<cra
 
 async fn logs_handler() -> Json<Vec<String>> {
     Json(crate::activity::raw_log())
-}
-
-#[derive(Deserialize)]
-struct ExcludeOne {
-    path: String,
-}
-
-async fn exclude_one_handler(Json(body): Json<ExcludeOne>) -> Result<StatusCode, (StatusCode, String)> {
-    if body.path.is_empty() || body.path.contains('\n') {
-        return Err((StatusCode::BAD_REQUEST, "Not a file path".to_string()));
-    }
-    crate::excludes::exclude_path(&body.path).await.map_err(|err| (StatusCode::BAD_REQUEST, format!("{err:#}")))?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
@@ -598,7 +500,6 @@ async fn mark_handler() -> impl IntoResponse {
 async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
     let pledge_snapshot = { state.pledge_book.lock().unwrap().clone() };
     let cycle_snapshot = { state.cycle_stats.lock().unwrap().clone() };
-    let reconcile_snapshot = { state.reconcile_stats.lock().unwrap().clone() };
     let progress_snapshot: HashMap<String, crate::backup::CycleProgress> =
         { state.cycle_progress.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.snapshot())).collect() };
 
@@ -641,25 +542,9 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         // the buddy runs more than one.
         let pledge_used = receive::account_received_bytes(&pledge_snapshot, &node_id);
         let cycle = cycle_snapshot.get(&node_id).cloned();
-        let last_reconcile = reconcile_snapshot.get(&node_id).cloned();
 
-        // Encrypted bytes (comparable to the buddy's own received totals,
-        // which are ciphertext too), straight from the index.
-        let (sent_files, sent_bytes) = crate::index::get().sent_summary(&node_id).unwrap_or((0, 0));
-        let chunked_sent = crate::chunked::last_snapshot_summary(&node_id);
-        let (sent_files, sent_bytes) = match chunked_sent {
-            Some((files, bytes)) => (files as usize, bytes),
-            None => (sent_files, sent_bytes),
-        };
-
-        let sender_dir = state.buddy_files_dir.join(&node_id);
-        // Live files only: the listing also has deleted-but-recoverable
-        // entries (kept under .versions/ for restores), which made this
-        // read one more than the sender's own count and the reconciliation.
-        let received: Vec<_> = receive::list_sender_files(&sender_dir).await.into_iter().filter(|f| !f.deleted).collect();
-        let received_files = received.len();
-        let received_total_bytes: u64 = received.iter().map(|f| f.size).sum();
-        let received_repo_bytes = crate::repo::repo_size(&sender_dir).await;
+        let (sent_files, sent_bytes) = crate::chunked::last_snapshot_summary(&node_id).unwrap_or((0, 0));
+        let received_repo_bytes = crate::repo::repo_size(&state.buddy_files_dir.join(&node_id)).await;
 
         // A buddy only counts as stale once we've actually tried and
         // failed — a brand-new pairing with no cycle yet gets the existing
@@ -678,17 +563,13 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             node_id,
             pledged_bytes: pledge.pledged_bytes,
             received_bytes_counted: pledge_used,
-            received_files,
-            received_total_bytes,
-            sent_files,
+            sent_files: sent_files as usize,
             sent_bytes,
-            sent_chunked: chunked_sent.is_some(),
             received_repo_bytes,
             removal_due_unix,
             in_progress,
             last_cycle: cycle,
             stale,
-            last_reconcile,
         });
     }
 
@@ -705,11 +586,6 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
             }
         },
         None => None,
-    };
-
-    let resending = match &state.backup_dir {
-        Some(dir) => resending_files(dir).await,
-        None => Vec::new(),
     };
 
     let label = state.self_label.lock().unwrap().clone();
@@ -741,7 +617,6 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
         mdns_peers_visible: state.mdns_peers.lock().unwrap().len(),
         cycle_interval_secs: state.cycle_interval_secs,
         local_backup,
-        resending,
         disk,
         pledged_out_total_bytes,
         buddies,
@@ -749,12 +624,14 @@ async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
     })
 }
 
-// Connects to the buddy and asks what they're holding for us — live, over
-// the sync protocol, not cached — so the file browser always reflects
-// what's actually restorable right now. A buddy with thousands of files
-// means a bigger response, not a slower UI: the browser does the
-// search/filter client-side over the whole list rather than paging
-// through the API, which is simpler and plenty fast at this scale.
+// Connects to the buddy and reads what our backup there holds — live,
+// over the sync protocol, not cached — so the file browser always reflects
+// what's actually restorable right now: the latest snapshot's files, plus
+// files only in older ones (deleted since). Also the pack files, which are
+// what the buddy's disk actually holds, for "What your buddy sees". The
+// browser does the search/filter client-side over the whole list rather
+// than paging through the API, which is simpler and plenty fast at this
+// scale.
 async fn files_handler(
     State(state): State<AppState>,
     AxumPath(node_id_str): AxumPath<String>,
@@ -763,25 +640,10 @@ async fn files_handler(
         Ok(id) => id,
         Err(_) => return (StatusCode::BAD_REQUEST, "not a valid Iroh node id".to_string()).into_response(),
     };
-
-    // A chunked backup also sends its pack files: that's what the buddy's
-    // disk actually holds, for "What your buddy sees".
-    if crate::chunked::has_repo(&node_id_str) {
-        return match crate::chunked_restore::list(&state.endpoint, &state.relay_url, buddy_id).await {
-            Ok(listing) => {
-                Json(serde_json::json!({ "files": listing.files, "stored": listing.packs, "chunked": true }))
-                    .into_response()
-            }
-            Err(err) => {
-                (StatusCode::BAD_GATEWAY, format!("couldn't read your chunked backup on this buddy: {err}"))
-                    .into_response()
-            }
-        };
-    }
-    match crate::restore::list_buddy_files(&state.endpoint, &state.relay_url, buddy_id).await {
-        Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
+    match crate::chunked_restore::list(&state.endpoint, &state.relay_url, buddy_id).await {
+        Ok(listing) => Json(serde_json::json!({ "files": listing.files, "stored": listing.packs })).into_response(),
         Err(err) => {
-            (StatusCode::BAD_GATEWAY, format!("couldn't reach buddy to list files: {err}")).into_response()
+            (StatusCode::BAD_GATEWAY, format!("couldn't read your backup on this buddy: {err}")).into_response()
         }
     }
 }
@@ -809,12 +671,12 @@ async fn buddy_disk_handler(
     }
 }
 
-/// How much of a stored file "What your buddy sees" shows.
-const PEEK_BYTES: usize = 256;
+/// How much of a pack "What your buddy sees" shows.
+const PEEK_BYTES: u64 = 256;
 
-// The start of one stored file as the buddy holds it (ciphertext, never
-// decrypted), for "What your buddy sees". `path` is the stored (remote)
-// name from the file list, since that's what the buddy's disk knows it by.
+// The start of one pack as the buddy holds it (encrypted, never
+// decrypted), for "What your buddy sees". `path` is the pack's path in the
+// buddy's `.repo/` folder, from the file list's `stored`.
 async fn peek_handler(
     State(state): State<AppState>,
     AxumPath(node_id_str): AxumPath<String>,
@@ -825,9 +687,10 @@ async fn peek_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "not a valid Iroh node id".to_string()).into_response(),
     };
 
-    match crate::restore::peek_buddy_file(&state.endpoint, &state.relay_url, buddy_id, &query.path, PEEK_BYTES)
-        .await
-    {
+    let Some(pack) = crate::chunked_restore::pack_id(&query.path) else {
+        return (StatusCode::BAD_REQUEST, "not a pack file".to_string()).into_response();
+    };
+    match crate::chunked_restore::peek_pack(&state.endpoint, &state.relay_url, buddy_id, pack, PEEK_BYTES).await {
         Ok(bytes) => Json(serde_json::json!({ "path": query.path, "hex": hex::encode(&bytes) })).into_response(),
         Err(err) => {
             (StatusCode::BAD_GATEWAY, format!("couldn't read that file from your buddy: {err}")).into_response()
@@ -835,7 +698,7 @@ async fn peek_handler(
     }
 }
 
-// Asks the buddy what backup slots still exist for one path — live, same
+// A file's earlier versions across the snapshots still kept — live, same
 // as files_handler, so "what can I recover" always reflects what's
 // actually on their disk right now.
 async fn versions_handler(
@@ -848,8 +711,7 @@ async fn versions_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "not a valid Iroh node id".to_string()).into_response(),
     };
 
-    match crate::restore::list_file_versions(&state.endpoint, &state.relay_url, buddy_id, &query.path).await
-    {
+    match crate::chunked_restore::list_versions(&state.endpoint, &state.relay_url, buddy_id, &query.path).await {
         Ok(versions) => Json(ListVersionsResponse { versions }).into_response(),
         Err(err) => {
             (StatusCode::BAD_GATEWAY, format!("couldn't reach buddy for version history: {err}"))
@@ -858,43 +720,14 @@ async fn versions_handler(
     }
 }
 
-/// "Delete permanently" on a deleted file in Browse files: asks the buddy
-/// to drop the backup copies it's keeping of it (restore::purge_deleted).
-async fn purge_handler(
-    State(state): State<AppState>,
-    AxumPath(node_id_str): AxumPath<String>,
-    Json(body): Json<PathQuery>,
-) -> impl IntoResponse {
-    let buddy_id: EndpointId = match node_id_str.parse() {
-        Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "not a valid Iroh node id" }))).into_response(),
-    };
-    match crate::restore::purge_deleted(&state.endpoint, &state.relay_url, buddy_id, &body.path).await {
-        Ok(()) => {
-            tracing::info!(buddy = %node_id_str, path = %body.path, "deleted a file's backup copies permanently");
-            crate::activity::record(
-                crate::activity::kind::SETTINGS,
-                Some(&crate::activity::label(&node_id_str)),
-                format!("Deleted the kept copies of {} permanently", body.path),
-                Vec::new(),
-            );
-            Json(serde_json::json!({ "ok": true })).into_response()
-        }
-        Err(err) => {
-            tracing::warn!(buddy = %node_id_str, path = %body.path, error = %err, "delete permanently failed");
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": err.to_string() }))).into_response()
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct ListVersionsResponse {
-    versions: Vec<crate::protocol::VersionEntry>,
+    versions: Vec<crate::chunked_restore::VersionEntry>,
 }
 
-// Restores one backup slot of one file — see restore::restore_version for
-// where it ends up on disk (suffixed, alongside a normal restore, never
-// overwriting it).
+// Restores one earlier version of one file — see
+// chunked_restore::restore_version for where it ends up on disk
+// (suffixed, alongside a normal restore, never overwriting it).
 async fn restore_version_handler(
     State(state): State<AppState>,
     AxumPath(node_id_str): AxumPath<String>,
@@ -911,10 +744,9 @@ async fn restore_version_handler(
             .into_response();
     }
 
-    match crate::restore::restore_version(
+    match crate::chunked_restore::restore_version(
         &state.endpoint,
         &state.relay_url,
-        &state.passphrase,
         buddy_id,
         &restore_dir,
         &body.path,
@@ -926,7 +758,7 @@ async fn restore_version_handler(
             crate::activity::record(
                 crate::activity::kind::RESTORE,
                 Some(&crate::activity::label(&node_id_str)),
-                format!("Restored an older copy (version {}) of {}", body.version, body.path),
+                format!("Restored an earlier version (version {}) of {}", body.version, body.path),
                 Vec::new(),
             );
             tracing::info!(
@@ -963,12 +795,9 @@ async fn restore_version_handler(
 // takes an explicit destination. An empty/absent `paths` in the request
 // body means "restore everything"; specific paths (from the file
 // browser) mean just those. Either way, this always resolves against a
-// fresh file list first (rather than trusting an empty `paths` straight
-// to restore::run_restore, or specific paths straight to
-// restore::restore_selected) so it can: skip deleted-but-recoverable
-// entries up front instead of wasting a round trip on a Get that can
-// only fail, and know the total file count/bytes before starting, which
-// is what makes restore-progress polling possible (see
+// fresh file list first so it can skip deleted-but-recoverable entries
+// (those restore from History) and know the total file count/bytes before
+// starting, which is what makes restore-progress polling possible (see
 // restore_progress_handler below).
 async fn restore_handler(
     State(state): State<AppState>,
@@ -987,10 +816,10 @@ async fn restore_handler(
             .into_response();
     }
 
-    let all_files = match crate::restore::list_buddy_files(&state.endpoint, &state.relay_url, buddy_id).await {
-        Ok(files) => files,
+    let all_files = match crate::chunked_restore::list(&state.endpoint, &state.relay_url, buddy_id).await {
+        Ok(listing) => listing.files,
         Err(err) => {
-            return (StatusCode::BAD_GATEWAY, format!("couldn't reach buddy to list files: {err}"))
+            return (StatusCode::BAD_GATEWAY, format!("couldn't read your backup on this buddy: {err}"))
                 .into_response();
         }
     };
@@ -1009,10 +838,9 @@ async fn restore_handler(
     }));
     state.restore_progress.lock().unwrap().insert(node_id_str.clone(), progress.clone());
 
-    let result = crate::restore::restore_selected(
+    let result = crate::chunked_restore::restore_files(
         &state.endpoint,
         &state.relay_url,
-        &state.passphrase,
         buddy_id,
         &restore_dir,
         &selected,
@@ -1320,13 +1148,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     background: #11141a; border: 1px solid var(--border); font-size: 0.7rem; line-height: 1.45;
     white-space: pre-wrap; word-break: break-all; color: var(--text-muted);
   }
-  .resend-row {
-    display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
-    padding: 0.55rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem;
-  }
-  .resend-row:last-child { border-bottom: none; }
-  .resend-row .path { word-break: break-all; }
-  .resend-row button { padding: 0.25rem 0.6rem; font-size: 0.75rem; flex-shrink: 0; }
   .excludes-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.6rem; flex-wrap: wrap; }
   #excludes-builtin summary { cursor: pointer; font-size: 0.85rem; margin-top: 0.9rem; }
   .builtin-group { margin-top: 0.6rem; font-size: 0.8rem; }
@@ -1428,16 +1249,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
     </div>
     <div class="bar-track"><div class="bar-fill" id="bw-bar" style="width:0%"></div></div>
     <div class="muted" style="margin-top:0.4rem; font-size:0.78rem;" id="bw-note"></div>
-  </div>
-  <div class="card" id="resending-card" style="display:none;">
-    <h2>Big files that keep re-sending</h2>
-    <div class="muted">
-      Any change sends the whole file again, to every buddy, so these add up (and count toward relay
-      bandwidth when a buddy isn't reached directly). If one doesn't need an off-site copy, exclude it. For a
-      VM disk or a database, back up an export of it instead.
-    </div>
-    <div id="resending-list"></div>
-    <div class="restore-result" id="resending-result"></div>
   </div>
   <div class="card" id="excludes-card" style="display:none;">
     <h2>Exclusions</h2>
@@ -1620,72 +1431,33 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
+// What a buddy keeps with us: their backup's stored size (its file count
+// is inside it, encrypted).
+function receivedText(b) {
+  return b.received_repo_bytes ? fmtBytes(b.received_repo_bytes) + " backup" : "nothing yet";
+}
+
 // One line + bar fraction for a backup cycle that's running right now
 // (status.buddies[].in_progress — see backup.rs's CycleProgress), so a
 // long first backup shows how far along it is instead of "no cycle yet".
-// What a buddy keeps with us: whole files by count, a chunked backup by
-// its stored size (its file count is inside it, encrypted), or both while
-// they move over.
-function receivedText(b) {
-  const parts = [];
-  if (b.received_files > 0 || !b.received_repo_bytes) {
-    parts.push(b.received_files + " file(s), " + fmtBytes(b.received_total_bytes));
-  }
-  if (b.received_repo_bytes) parts.push(fmtBytes(b.received_repo_bytes) + " chunked backup");
-  return parts.join(" + ");
-}
 
 function describeCycleProgress(p) {
   const n = (x) => Number(x).toLocaleString();
-  const curFrac = p.current_size > 0 ? Math.min(1, p.current_done / p.current_size) : 0;
-  const curSize = p.current_size > 0 ? " (" + fmtBytes(p.current_done) + " of " + fmtBytes(p.current_size) + ")" : "";
   if (p.phase === "checking") {
-    const frac = p.files_total > 0 ? (p.files_checked + curFrac) / p.files_total : 0;
-    return {
-      frac,
-      line: "Checking for new or changed files — " + n(p.files_checked) + " of " + n(p.files_total) +
-        (p.current_path ? " — reading " + p.current_path + curSize : ""),
-    };
+    return { frac: 0, line: "Checking " + n(p.files_total) + " file(s) for changes" };
   }
-  if (p.phase === "deleting") {
-    const frac = p.files_to_delete > 0 ? p.files_deleted / p.files_to_delete : 1;
-    return {
-      frac,
-      line: "Telling your buddy about deleted files — " + n(p.files_deleted) + " of " + n(p.files_to_delete),
-    };
+  // A backup reads every file but sends only new chunks, so progress is
+  // bytes read, not sent.
+  const done = Math.min(p.bytes_total, p.bytes_read);
+  const frac = p.bytes_total > 0 ? done / p.bytes_total : 0;
+  let line = "Backing up — " + fmtBytes(done) + " of " + fmtBytes(p.bytes_total) + " read (" +
+    Math.floor(frac * 100) + "%), " + n(p.files_total) + " file(s)";
+  const elapsed = p.sending_started_unix ? p.now_unix - p.sending_started_unix : 0;
+  const remaining = p.bytes_total - done;
+  if (elapsed >= 5 && done > 0 && remaining > 0) {
+    const rate = done / elapsed;
+    line += " — ~" + fmtEta(remaining / rate) + " left at " + fmtBytes(rate) + "/s";
   }
-  const done = Math.min(p.bytes_to_send, p.bytes_sent + p.current_done);
-  const frac = p.bytes_to_send > 0 ? done / p.bytes_to_send : (p.files_to_send > 0 ? p.files_sent / p.files_to_send : 0);
-  // A chunked backup reads every file but sends only new chunks, and
-  // reports bytes read rather than files sent.
-  if (p.chunked) {
-    let line = "Backing up in chunks — " + fmtBytes(done) + " of " + fmtBytes(p.bytes_to_send) + " read (" +
-      Math.floor(frac * 100) + "%), " + n(p.files_to_send) + " file(s)";
-    const elapsed = p.sending_started_unix ? p.now_unix - p.sending_started_unix : 0;
-    const remaining = p.bytes_to_send - done;
-    if (elapsed >= 5 && done > 0 && remaining > 0) {
-      const rate = done / elapsed;
-      line += " — ~" + fmtEta(remaining / rate) + " left at " + fmtBytes(rate) + "/s";
-    }
-    return { frac, line };
-  }
-  let line = "Backing up " + n(Math.min(p.files_sent + 1, p.files_to_send)) + " of " + n(p.files_to_send) + " file(s)";
-  // After upgrading to 0.14.0, files already backed up go once more under
-  // encrypted names; without this it looks like everything changed.
-  if (p.files_hiding_names > 0) line += " (" + n(p.files_hiding_names) + " to hide their names)";
-  if (p.bytes_to_send > 0) {
-    line += " — " + fmtBytes(done) + " of " + fmtBytes(p.bytes_to_send) + " (" + Math.floor(frac * 100) + "%)";
-    const elapsed = p.sending_started_unix ? p.now_unix - p.sending_started_unix : 0;
-    const remaining = p.bytes_to_send - done;
-    // Bytes a resumed upload found already on the buddy weren't sent
-    // this cycle; leave them out of the speed.
-    const sentNow = done - (p.bytes_skipped || 0);
-    if (elapsed >= 5 && sentNow > 0 && remaining > 0) {
-      const rate = sentNow / elapsed;
-      line += " — ~" + fmtEta(remaining / rate) + " left at " + fmtBytes(rate) + "/s";
-    }
-  }
-  if (p.current_path) line += " — " + p.current_path + curSize;
   return { frac, line };
 }
 
@@ -1864,8 +1636,7 @@ const browseState = {
   nodeId: null,
   label: "",
   files: [], // flat, as returned by the server
-  stored: null, // a chunked backup's pack files, as the buddy stores them
-  chunked: false,
+  stored: [], // the pack files, as the buddy stores them
   tree: null, // built from files by buildFileTree()
   currentPath: "", // "" = root; "testdir"; "a/b"; ... — folder currently open
   selected: new Set(),
@@ -1882,10 +1653,10 @@ const browseRestoreSelected = document.getElementById("browse-restore-selected")
 const browseRestoreAll = document.getElementById("browse-restore-all");
 const browseResult = document.getElementById("browse-result");
 
-// "What your buddy sees": the same file list, but by the names and sizes
-// it's stored under on the buddy's disk, plus the first bytes of one file
-// as they hold it. Lets people check for themselves that what sits on
-// someone else's machine is unreadable, instead of taking it on trust.
+// "What your buddy sees": the pack files the backup is stored in on the
+// buddy's disk, plus the first bytes of one as they hold it. Lets people
+// check for themselves that what sits on someone else's machine is
+// unreadable, instead of taking it on trust.
 const browseBuddyViewBtn = document.getElementById("browse-buddy-view");
 const buddyViewIntro = document.getElementById("buddy-view-intro");
 const storedList = document.getElementById("stored-list");
@@ -1909,7 +1680,7 @@ function hexDump(hex) {
 async function peekStored(file, row) {
   storedList.querySelectorAll(".stored-row.active").forEach((r) => r.classList.remove("active"));
   if (row) row.classList.add("active");
-  storedBytes.textContent = "Reading the start of this file from your buddy…";
+  storedBytes.textContent = "Reading the start of this pack from your buddy…";
   try {
     const res = await fetch("/api/buddies/" + encodeURIComponent(browseState.nodeId) +
       "/peek?path=" + encodeURIComponent(file.remote));
@@ -1925,50 +1696,34 @@ async function peekStored(file, row) {
 }
 
 function renderBuddyView() {
-  // Deleted files only survive as old copies, which a plain Get can't
-  // fetch, so the view sticks to live ones. A chunked backup is held as
-  // encrypted pack files instead, which is all the buddy's disk shows.
-  const live = (browseState.stored || browseState.files.filter((f) => !f.deleted))
-    .slice().sort((a, b) => a.remote.localeCompare(b.remote));
-  const total = live.reduce((sum, f) => sum + f.size, 0);
-  const noun = browseState.stored ? "encrypted pack file" : "file";
-  // What a buddy can and can't learn differs: whole files (one stored
-  // file per file, names encrypted) give away the shape of your folders;
-  // a chunked backup's packs give away only their own sizes.
-  document.getElementById("buddy-view-explain").textContent = browseState.stored
-    ? "They can see how many pack files there are, how big each one is, and when they change. They can't see " +
-      "how many files you back up, their names or sizes, your folders, or anything inside a file. Click a " +
-      "pack to see its first bytes exactly as it's stored on their disk."
-    : "They can see how many files you back up, each one's size, how folders nest and how many entries " +
-      "each holds, and when things change. They can't see any file or folder name, or anything inside a file. " +
-      "Click a file to see the first bytes of it exactly as it's stored on their disk.";
-  buddyViewIntro.textContent = live.length
-    ? browseState.label + " holds " + live.length + " " + noun + (live.length === 1 ? "" : "s") +
+  const packs = browseState.stored.slice().sort((a, b) => a.remote.localeCompare(b.remote));
+  const total = packs.reduce((sum, f) => sum + f.size, 0);
+  document.getElementById("buddy-view-explain").textContent =
+    "They can see how many pack files there are, how big each one is, and when they change. They can't see " +
+    "how many files you back up, their names or sizes, your folders, or anything inside a file. Click a " +
+    "pack to see its first bytes exactly as it's stored on their disk.";
+  buddyViewIntro.textContent = packs.length
+    ? browseState.label + " holds " + packs.length + " encrypted pack file" + (packs.length === 1 ? "" : "s") +
       " of yours, " + fmtBytes(total) + " in all. Here's the list as it sits on their disk." +
-      (browseState.stored ? " Your file names, sizes and folders are inside them, encrypted." : "")
-    : browseState.label + " isn't holding any files of yours yet.";
+      " Your file names, sizes and folders are inside them, encrypted."
+    : browseState.label + " isn't holding any of your backup yet.";
   storedList.innerHTML = "";
-  for (const f of live.slice(0, STORED_ROWS_SHOWN)) {
+  for (const f of packs.slice(0, STORED_ROWS_SHOWN)) {
     const row = document.createElement("div");
     row.className = "stored-row";
-    // Same stored and real name means it went over before names were
-    // encrypted (clients before 0.14.0): say so rather than hide it.
-    const plain = f.remote === f.path
-      ? ' <span class="stored-size">(name readable: stored by a client before 0.14.0)</span>'
-      : "";
-    row.innerHTML = '<span class="stored-name">' + escapeHtml(f.remote) + plain + "</span>" +
+    row.innerHTML = '<span class="stored-name">' + escapeHtml(f.remote) + "</span>" +
       '<span class="stored-size">' + fmtBytes(f.size) + "</span>";
     row.addEventListener("click", () => peekStored(f, row));
     storedList.appendChild(row);
   }
-  if (live.length > STORED_ROWS_SHOWN) {
+  if (packs.length > STORED_ROWS_SHOWN) {
     const more = document.createElement("div");
     more.className = "stored-row";
-    more.textContent = "…and " + (live.length - STORED_ROWS_SHOWN) + " more";
+    more.textContent = "…and " + (packs.length - STORED_ROWS_SHOWN) + " more";
     storedList.appendChild(more);
   }
-  storedBytes.textContent = live.length ? "Pick a file above." : "";
-  if (live.length) peekStored(live[0], storedList.firstChild);
+  storedBytes.textContent = packs.length ? "Pick a pack above." : "";
+  if (packs.length) peekStored(packs[0], storedList.firstChild);
 }
 
 function setBuddyView(on) {
@@ -1986,8 +1741,7 @@ function closeBrowseModal() {
   browseModal.classList.remove("open");
   browseState.nodeId = null;
   browseState.files = [];
-  browseState.stored = null;
-  browseState.chunked = false;
+  browseState.stored = [];
   browseState.tree = null;
   browseState.currentPath = "";
   browseState.selected.clear();
@@ -2072,11 +1826,10 @@ function renderBreadcrumb() {
 // keeps working unchanged — appending a fragment appends both children in
 // order. The history panel stays empty and hidden until "History" is
 // clicked, so opening the browser doesn't fire a versions request per file.
-// A `deleted` item has no live file left — just a backup slot under
-// .versions/ (see collect_deleted in receive.rs). It can't be restored the
-// normal way (there's nothing live to fetch), so it gets no checkbox and
-// no plain "Restore" button, only "History" to pick a surviving version —
-// same path an overwritten file's older versions already go through.
+// A `deleted` item is only in older snapshots (see chunked_restore.rs's
+// list). It isn't in the latest one, so it gets no checkbox and no plain
+// "Restore" button, only "History" to pick a version — same path an
+// overwritten file's older versions already go through.
 function makeFileRow(item) {
   const frag = document.createDocumentFragment();
   const row = document.createElement("div");
@@ -2088,7 +1841,6 @@ function makeFileRow(item) {
     <span class="size">${fmtBytes(item.size)}</span>
     ${item.deleted ? "" : '<button class="secondary file-restore-one">Restore</button>'}
     <button class="secondary file-history-toggle">History</button>
-    ${item.deleted && !browseState.chunked ? '<button class="secondary file-purge" style="color: var(--danger);">Delete permanently</button>' : ""}
   `;
   const history = document.createElement("div");
   history.className = "file-history";
@@ -2122,37 +1874,6 @@ function makeFileRow(item) {
     }
   });
 
-  row.querySelector(".file-purge")?.addEventListener("click", async (ev) => {
-    const ok = window.confirm(
-      "Delete permanently?\n\n" + item.path + "\n\n" +
-      "You deleted this file, but your buddy is keeping copies of it for 30 days in case you need it back. " +
-      "This removes those copies now, so it can't be restored afterwards. Nothing on this device is changed."
-    );
-    if (!ok) return;
-    const btn = ev.target;
-    btn.disabled = true;
-    browseResult.textContent = "Deleting " + item.path + " permanently…";
-    browseResult.style.color = "";
-    try {
-      const res = await fetch("/api/buddies/" + encodeURIComponent(browseState.nodeId) + "/purge", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: item.path }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
-      browseState.files = browseState.files.filter((f) => f.path !== item.path);
-      browseState.tree = buildFileTree(browseState.files);
-      renderBrowseView();
-      browseResult.textContent = "Deleted " + item.path + " permanently.";
-      browseResult.style.color = "var(--ok)";
-    } catch (err) {
-      btn.disabled = false;
-      browseResult.textContent = "Couldn't delete permanently: " + err.message;
-      browseResult.style.color = "var(--danger)";
-    }
-  });
-
   let historyLoaded = false;
   row.querySelector(".file-history-toggle").addEventListener("click", async () => {
     const wasOpen = history.style.display !== "none";
@@ -2179,11 +1900,10 @@ function makeFileRow(item) {
   return frag;
 }
 
-// Every overwrite or delete keeps the previous content as a numbered
-// backup slot (see receive.rs::rotate_versions) — this lists whatever
-// slots a buddy still has for one path and lets the person pull an older
-// one back, separately from a normal restore (which only ever gives you
-// the live copy).
+// A file's earlier contents across the snapshots still kept (see
+// chunked_restore.rs's list_versions) — this lists them and lets the
+// person pull one back, separately from a normal restore (which only ever
+// gives you the latest).
 function renderVersionHistory(container, path, versions) {
   if (versions.length === 0) {
     container.textContent = "No earlier versions kept for this file.";
@@ -2192,7 +1912,6 @@ function renderVersionHistory(container, path, versions) {
   container.innerHTML = "";
   for (const v of versions) {
     let when = v.modified_unix ? fmtAgo(v.modified_unix) : "at an unknown time";
-    // Buddies on 0.8.2+ remove copies after 30 days and say when.
     if (v.expires_unix) {
       const days = Math.max(0, Math.ceil((v.expires_unix - Date.now() / 1000) / 86400));
       when += days > 0 ? ", removed in " + days + " day" + (days === 1 ? "" : "s") : ", removed soon";
@@ -2333,8 +2052,7 @@ async function openBrowseModal(nodeId, label) {
   browseState.nodeId = nodeId;
   browseState.label = label;
   browseState.files = [];
-  browseState.stored = null;
-  browseState.chunked = false;
+  browseState.stored = [];
   browseState.tree = null;
   browseState.currentPath = "";
   browseState.selected.clear();
@@ -2352,8 +2070,7 @@ async function openBrowseModal(nodeId, label) {
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
     browseState.files = (body.files || []).slice().sort((a, b) => a.path.localeCompare(b.path));
-    browseState.stored = body.stored || null;
-    browseState.chunked = !!body.chunked;
+    browseState.stored = body.stored || [];
     browseState.tree = buildFileTree(browseState.files);
     renderBrowseView();
     browseBuddyViewBtn.disabled = false;
@@ -2422,8 +2139,8 @@ browseRestoreAll.addEventListener("click", async () => {
   }
 });
 
-// Must match protocol.rs's RejectReason::message() for PledgeExceeded and
-// DiskFull.
+// Must match protocol.rs's PutRejectReason::message() for PledgeExceeded and
+// DiskFull: a refused backup's cycle detail is that message.
 const DONT_FIT_REASONS = [
   "your buddy's pledge to you is full",
   "your buddy doesn't have enough real disk space left",
@@ -2432,23 +2149,21 @@ const DONT_FIT_REASONS = [
 function renderBuddy(b) {
   const pct = b.pledged_bytes > 0 ? Math.min(100, (b.received_bytes_counted / b.pledged_bytes) * 100) : 0;
   const cycle = b.last_cycle;
-  // Files the buddy refused only because they don't fit (pledge or disk
-  // full) aren't a broken backup: everything else synced, and nothing will
-  // change until the pledge grows or the files go. Shown as a calm amber
-  // "don't fit" instead of a red "backup failed".
-  const onlyDontFit =
-    cycle && !cycle.ok && cycle.kind === "backup" && cycle.files_failed > 0 &&
-    cycle.failed_files && cycle.failed_files.length > 0 &&
-    cycle.failed_files.every((f) => DONT_FIT_REASONS.includes(f.reason));
+  // A backup the buddy refused only because it doesn't fit (pledge or disk
+  // full) isn't broken: the last snapshot is still there, and nothing will
+  // change until the pledge grows or files go. Shown as a calm amber
+  // "doesn't fit" instead of a red "backup failed".
+  const dontFit =
+    cycle && !cycle.ok && cycle.kind === "backup" && DONT_FIT_REASONS.some((r) => (cycle.detail || "").includes(r));
   let cyclePill = '<span class="pill pill-pending">no cycle yet</span>';
   let cycleDetail = "";
   if (cycle) {
     cyclePill = cycle.ok
       ? '<span class="pill pill-ok">' + cycle.kind + ' ok</span>'
-      : onlyDontFit
-        ? '<span class="pill pill-warn">' + cycle.files_failed + " file(s) don't fit</span>"
+      : dontFit
+        ? "<span class=\"pill pill-warn\">doesn't fit</span>"
         : '<span class="pill pill-err">' + cycle.kind + ' failed</span>';
-    cycleDetail = (onlyDontFit ? "everything else is backed up" : cycle.detail) + " · " + fmtAgo(cycle.at);
+    cycleDetail = cycle.detail + " · " + fmtAgo(cycle.at);
     if (cycle.kind === "backup" && cycle.ok) {
       cycleDetail = "sent " + (cycle.files_sent ?? 0) + ", deleted " + (cycle.files_deleted ?? 0) + " · " + fmtAgo(cycle.at);
       const rate = fmtRate(cycle.bytes_sent, cycle.duration_ms);
@@ -2458,7 +2173,7 @@ function renderBuddy(b) {
       }
       if (cycle.connection) cycleDetail += " · " + fmtConnection(cycle.connection);
     }
-    if (cycle.consecutive_failures > 1 && !onlyDontFit) {
+    if (cycle.consecutive_failures > 1 && !dontFit) {
       cycleDetail += " · " + cycle.consecutive_failures + " cycles in a row now";
     }
   }
@@ -2488,14 +2203,11 @@ function renderBuddy(b) {
     stalePill = ' <span class="pill pill-err">stale — last synced ' + lastOkText + '</span>';
   }
   let failedLine = "";
-  if (onlyDontFit) {
-    const sample = cycle.failed_files.map((f) => escapeHtml(f.path)).join(", ");
-    const more = cycle.files_failed > cycle.failed_files.length ? ", …" : "";
+  if (dontFit) {
     failedLine =
-      '<div class="muted" style="margin-top: 0.4rem; overflow-wrap: anywhere;">' +
-      cycle.files_failed + " file(s) don't fit in what this buddy has room for. " +
-      "They'll go as soon as there's space: ask your buddy for a bigger pledge, or remove files from your backup folder." +
-      '<details style="margin-top: 0.2rem;"><summary>Which files</summary>' + sample + more + "</details></div>";
+      '<div class="muted" style="margin-top: 0.4rem;">' +
+      "Your latest changes don't fit in what this buddy has room for; the last backup that did is still there. " +
+      "They'll go as soon as there's space: ask your buddy for a bigger pledge, or remove files from your backup folder.</div>";
   } else if (cycle && cycle.files_failed > 0) {
     const sample =
       cycle.failed_files && cycle.failed_files.length
@@ -2503,43 +2215,7 @@ function renderBuddy(b) {
         : "";
     failedLine =
       '<div class="muted" style="color: var(--danger); margin-top: 0.4rem; overflow-wrap: anywhere;">⚠ ' +
-      cycle.files_failed + " file(s) won't send/receive" + sample + "</div>";
-  }
-
-  // Reconciliation runs on its own, much slower cadence (every ~10
-  // minutes, not every cycle — see backup::reconcile_with_buddy), so this
-  // is deliberately separate from the ordinary cycle detail above rather
-  // than folded into it.
-  let reconcileLine = "";
-  const rec = b.last_reconcile;
-  if (rec) {
-    if (rec.error) {
-      reconcileLine =
-        '<div class="muted" style="color: var(--danger); margin-top: 0.4rem;">⚠ reconciliation check failed ' +
-        fmtAgo(rec.at) + ": " + rec.error + "</div>";
-    } else if (rec.missing_on_buddy.length || rec.unexpected_on_buddy.length) {
-      const parts = [];
-      if (rec.missing_on_buddy.length) {
-        parts.push(
-          rec.missing_on_buddy.length + " missing on buddy (will re-send): " + rec.missing_on_buddy.join(", ")
-        );
-      }
-      if (rec.unexpected_on_buddy.length) {
-        parts.push(
-          rec.unexpected_on_buddy.length + " unexpected on buddy: " + rec.unexpected_on_buddy.join(", ")
-        );
-      }
-      reconcileLine =
-        '<div class="muted" style="color: var(--danger); margin-top: 0.4rem;">⚠ reconciliation (' +
-        fmtAgo(rec.at) + ") found drift — " + parts.join("; ") + "</div>";
-    } else if (rec.checked > 0) {
-      reconcileLine =
-        '<div class="muted" style="margin-top: 0.4rem;">✓ reconciled ' + fmtAgo(rec.at) +
-        " — " + rec.checked + " file(s) match the buddy's actual records</div>";
-    }
-    // checked === 0 with no error means an empty manifest — nothing to
-    // reconcile yet, so no line at all rather than a confusing "0 files
-    // match" message.
+      cycle.files_failed + " file(s) can't be backed up" + sample + "</div>";
   }
 
   const div = document.createElement("div");
@@ -2553,11 +2229,10 @@ function renderBuddy(b) {
     ${b.removal_due_unix ? `<div class="muted">Not one of your buddies' devices any more (a new device, or the pairing ended). What it keeps here is removed on ${escapeHtml(new Date(b.removal_due_unix * 1000).toLocaleDateString())}.</div>` : ""}
     <div class="muted">${cycleDetail}</div>
     ${failedLine}
-    ${reconcileLine}
     <div class="row" style="margin-top: 0.9rem;">
       <div>
         <div class="muted">You've sent them</div>
-        <div>${b.sent_files} file(s), ${fmtBytes(b.sent_bytes)}${b.sent_chunked ? " in the last snapshot" : ""}</div>
+        <div>${b.sent_files} file(s), ${fmtBytes(b.sent_bytes)} in the last snapshot</div>
       </div>
       <div>
         <div class="muted">They've sent you</div>
@@ -2701,7 +2376,6 @@ async function refresh() {
   }
   document.getElementById("device-uptime").textContent = fmtUptime(data.uptime_secs);
   if (data.backup_dir && !excludesLoaded) loadExcludes();
-  renderResending(data.resending || []);
   loadActivity();
   document.getElementById("device-mdns-peers").textContent =
     data.mdns_peers_visible + (data.mdns_peers_visible === 1 ? " peer" : " peers");
@@ -2841,51 +2515,6 @@ document.getElementById("password-form").addEventListener("submit", async (event
     passwordResult.textContent = err.message;
   } finally {
     save.disabled = false;
-  }
-});
-
-// --- Big files that keep re-sending ------------------------------------
-let resendingKey = "";
-function renderResending(items) {
-  const card = document.getElementById("resending-card");
-  card.style.display = items.length ? "block" : "none";
-  // Rebuilt only when the list changes, so a poll doesn't swallow a click.
-  const key = JSON.stringify(items);
-  if (key === resendingKey) return;
-  resendingKey = key;
-  document.getElementById("resending-list").innerHTML = items.map((f) => {
-    const times = f.sends + (f.sends === 1 ? " time" : " times");
-    const to = f.buddies > 1 ? " to " + f.buddies + " buddies" : "";
-    return '<div class="resend-row"><div><div class="path">' + escapeHtml(f.path) + '</div>' +
-      '<div class="muted">' + fmtBytes(f.size) + ", re-sent " + times + to + " this week, " +
-      fmtBytes(f.bytes) + " in all</div></div>" +
-      '<button class="secondary resend-exclude" data-path="' + escapeHtml(f.path) + '">Exclude</button></div>';
-  }).join("");
-}
-
-document.getElementById("resending-list").addEventListener("click", async (event) => {
-  const button = event.target.closest(".resend-exclude");
-  if (!button) return;
-  const path = button.dataset.path;
-  if (!confirm("Exclude " + path + "?\n\nIt stops being backed up and is removed from your buddies " +
-      "(they keep the last copy for 30 days). You can undo this in Exclusions.")) return;
-  const result = document.getElementById("resending-result");
-  button.disabled = true;
-  try {
-    const res = await fetch("/api/excludes/add", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: path }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    result.style.color = "";
-    result.textContent = "Excluded " + path + ". Applies on the next check.";
-    // Show the new line in the editor, unless something's being typed there.
-    if (excludesText.value === excludesSaved) loadExcludes();
-  } catch (err) {
-    button.disabled = false;
-    result.style.color = "var(--danger)";
-    result.textContent = "Not excluded: " + err.message;
   }
 });
 

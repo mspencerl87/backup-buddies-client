@@ -1,25 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Spencer LeBlanc
 
-//! Chunked backups, the sender's side (on unless CHUNKED_TRANSFERS=off).
+//! Backups, the sender's side.
 //!
-//! Instead of one encrypted copy per file, each buddy gets a restic-format
-//! repository built with rustic_core and stored on their side (repo.rs,
-//! through repo_backend.rs). Files are split into content-defined chunks,
+//! Each buddy gets a restic-format repository built with rustic_core and
+//! stored on their side (repo.rs, through repo_backend.rs). Files are split into content-defined chunks,
 //! so renaming or moving a file sends nothing and editing one sends only
 //! the chunks it touched; each cycle that finds a change is a snapshot.
 //! Measured before building it (2026-10-13, 1.9 GB of random data): a
 //! renamed 1 GB file and 300 moved photos stored 0 bytes, 1 MB overwritten
-//! in the middle of the 1 GB file stored ~1–6 MB, where whole-file backups
-//! re-send everything.
+//! in the middle of the 1 GB file stored ~1–6 MB, where the whole-file
+//! backups before client 0.19.0 re-sent everything.
 //!
-//! Only with buddies on client 0.16.0+ (protocol v5); older ones keep
-//! getting whole files. The default since 0.19.0.
+//! Buddies need client 0.16.0+ (protocol v5) to store a repository; since
+//! client 0.21.0 there's no whole-file fallback for older ones.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -49,20 +47,7 @@ const SNAPSHOT_HOST: &str = "backup-buddies";
 /// How often old snapshots are forgotten and the repository pruned.
 const RETENTION_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// After finding a buddy too old for chunked backups, how long to use
-/// whole files before asking again.
-const RECHECK_OLD_BUDDY: Duration = Duration::from_secs(60 * 60);
-
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-
-/// Buddies found too old for chunked backups, and when.
-static TOO_OLD: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// On unless CHUNKED_TRANSFERS says off (the default since 0.19.0).
-pub fn enabled() -> bool {
-    !std::env::var("CHUNKED_TRANSFERS")
-        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "false" | "0" | "no"))
-}
 
 /// Where per-buddy state and rustic's cache live (`DATA_DIR/chunked/`).
 pub fn init(data_dir: &Path) {
@@ -71,42 +56,6 @@ pub fn init(data_dir: &Path) {
 
 pub(crate) fn state_dir() -> PathBuf {
     DATA_DIR.get().cloned().unwrap_or_else(|| PathBuf::from("/data/chunked"))
-}
-
-/// The buddy answered with a protocol version too old for repositories.
-#[derive(Debug)]
-struct BuddyTooOld(u32);
-
-impl std::fmt::Display for BuddyTooOld {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "buddy speaks protocol {} — chunked backups need {REPO_PROTOCOL}", self.0)
-    }
-}
-
-impl std::error::Error for BuddyTooOld {}
-
-/// One backup cycle for `buddy_id`: chunked when it's on and the buddy can
-/// take it, whole files otherwise.
-pub async fn run_backup_cycle(
-    endpoint: &Endpoint,
-    relay_url: &RelayUrl,
-    backup_dir: &Path,
-    buddy_id: EndpointId,
-    progress: Option<&CycleProgressBook>,
-) -> Result<BackupCycleStats> {
-    let key = buddy_id.to_string();
-    let recently_old = TOO_OLD.lock().unwrap().get(&key).is_some_and(|at| at.elapsed() < RECHECK_OLD_BUDDY);
-    if !enabled() || recently_old {
-        return backup::run_backup_cycle(endpoint, relay_url, backup_dir, buddy_id, progress).await;
-    }
-    match run_chunked_cycle(endpoint, relay_url, backup_dir, buddy_id, progress).await {
-        Err(err) if err.downcast_ref::<BuddyTooOld>().is_some() => {
-            tracing::info!(buddy = %key, %err, "buddy's client is too old for chunked backups — sending whole files");
-            TOO_OLD.lock().unwrap().insert(key, Instant::now());
-            backup::run_backup_cycle(endpoint, relay_url, backup_dir, buddy_id, progress).await
-        }
-        other => other,
-    }
 }
 
 /// What we remember per buddy between cycles (`DATA_DIR/chunked/<id>.json`).
@@ -127,23 +76,9 @@ fn state_path(buddy: &str) -> PathBuf {
     state_dir().join(format!("{buddy}.json"))
 }
 
-/// Whether we keep a chunked backup with this buddy (a snapshot was saved
-/// to it at some point), so Browse files, restores and History read it
-/// rather than whole files.
-///
-/// Not while chunked backups are turned off: backups to that buddy are
-/// whole files again, so that's what there is to browse.
-pub(crate) fn has_repo(buddy: &str) -> bool {
-    enabled() && state_path(buddy).is_file()
-}
-
 /// Files and bytes in the last snapshot saved to this buddy, for the
-/// dashboard's "You've sent them" (our whole-file record of what was sent
-/// doesn't apply to a chunked backup).
+/// dashboard's "You've sent them". None before the first one.
 pub(crate) fn last_snapshot_summary(buddy: &str) -> Option<(u64, u64)> {
-    if !has_repo(buddy) {
-        return None;
-    }
     let state: State = serde_json::from_slice(&std::fs::read(state_path(buddy)).ok()?).ok()?;
     Some((state.files, state.bytes))
 }
@@ -197,7 +132,9 @@ pub(crate) fn master_key() -> MasterKey {
     .expect("a valid master key")
 }
 
-pub(crate) async fn run_chunked_cycle(
+/// One backup cycle for `buddy_id`: a snapshot when anything changed, and
+/// forget and prune once a day.
+pub async fn run_backup_cycle(
     endpoint: &Endpoint,
     relay_url: &RelayUrl,
     backup_dir: &Path,
@@ -207,16 +144,13 @@ pub(crate) async fn run_chunked_cycle(
     let buddy = buddy_id.to_string();
     let tracker = ProgressTracker::new(progress, &buddy);
     let scan = backup::scan_local_files(backup_dir).await?;
-    tracker.update(|p| {
-        p.files_total = scan.files.len();
-        p.files_checked = scan.files.len();
-    });
+    tracker.update(|p| p.files_total = scan.files.len());
     let mut state = load_state(&buddy).await;
 
-    // Same guard as whole-file backups: an empty folder where the last
-    // snapshot had files is far more likely an unmounted drive. Unlike
-    // whole files nothing would be deleted on the buddy (older snapshots
-    // keep everything for 30 days), but the new snapshot would be empty.
+    // An empty folder where the last snapshot had files is far more likely
+    // an unmounted drive. Nothing would be lost on the buddy (older
+    // snapshots keep everything for 30 days), but the new snapshot would
+    // be empty.
     if backup::looks_like_missing_drive(scan.files.len(), scan.unreadable.len(), state.files as usize)
         && !backup::allow_empty_backup_dir()
     {
@@ -252,20 +186,19 @@ pub(crate) async fn run_chunked_cycle(
     let version = backup::buddy_protocol_version(&conn).await;
     if version < REPO_PROTOCOL {
         conn.close(0u32.into(), b"done");
-        return Err(BuddyTooOld(version).into());
+        anyhow::bail!(
+            "your buddy's client is too old to store your backup (protocol {version}, needs {REPO_PROTOCOL}) —              ask them to update"
+        );
     }
     let meter = netinfo::PathMeter::start(&conn, netinfo::Direction::Sent);
     let quality = netinfo::connection_quality(&conn);
 
     let total_bytes: u64 = scan.files.iter().map(|f| f.size).sum();
     // rustic's byte counter (CycleProgressBars) drives the bar through
-    // the tracker's per-file counter, over every byte it reads.
+    // the tracker's counter, over every byte it reads.
     tracker.update(|p| {
         p.phase = "sending";
-        p.chunked = true;
-        p.bytes_to_send = total_bytes;
-        p.files_to_send = scan.files.len();
-        p.current_size = total_bytes;
+        p.bytes_total = total_bytes;
         p.sending_started_unix = Some(crate::dashboard::unix_now());
     });
 
@@ -332,81 +265,7 @@ pub(crate) async fn run_chunked_cycle(
     if let Err(err) = save_state(&buddy, &state).await {
         tracing::warn!(?err, "couldn't save chunked backup state — the next cycle will check everything again");
     }
-
-    // The whole-file copies sent before chunked backups are redundant now
-    // that a snapshot holds the same files. Only after a snapshot of a
-    // folder read in full, so nothing that couldn't be read this time
-    // loses its only copy.
-    if outcome.snapshot.is_some()
-        && state.files > 0
-        && scan.unreadable.is_empty()
-        && let Some(idx) = crate::index::try_get()
-    {
-        retire_whole_files(idx, endpoint, relay_url, buddy_id, &conn).await;
-    }
     Ok(stats)
-}
-
-/// Deletes, on the buddy, every whole file we sent it before chunked
-/// backups (and plaintext-named copies left from 0.14.0's renaming). Like
-/// any delete, each becomes a backup copy there for 30 days. Our record of
-/// them goes as they do, so this runs once; a failure is retried after the
-/// next snapshot.
-pub(crate) async fn retire_whole_files(
-    idx: &crate::index::Index,
-    endpoint: &Endpoint,
-    relay_url: &RelayUrl,
-    buddy_id: EndpointId,
-    conn: &iroh::endpoint::Connection,
-) {
-    let buddy = buddy_id.to_string();
-    let (Ok(sent), Ok(old_names)) = (idx.sent_entries(&buddy), idx.old_names(&buddy)) else { return };
-    if sent.is_empty() && old_names.is_empty() {
-        return;
-    }
-    let conn = if conn.close_reason().is_none() {
-        conn.clone()
-    } else {
-        let addr = EndpointAddr::new(buddy_id).with_relay_url(relay_url.clone());
-        match endpoint.connect(addr, protocol::ALPN).await {
-            Ok(conn) => conn,
-            Err(err) => {
-                tracing::warn!(%err, "couldn't reach the buddy to retire whole-file copies — will try after the next snapshot");
-                return;
-            }
-        }
-    };
-    let mut retired = 0;
-    for (path, entry) in &sent {
-        let Ok(remote) = crate::names::remote_path(path, entry.name_scheme) else { continue };
-        match backup::delete_one_file(&conn, &remote).await {
-            Ok(()) => {
-                let _ = idx.forget_sent(&buddy, std::slice::from_ref(path));
-                retired += 1;
-            }
-            Err(err) => {
-                tracing::warn!(%err, "couldn't retire a whole-file copy — will try after the next snapshot");
-                return;
-            }
-        }
-    }
-    for path in &old_names {
-        if backup::delete_one_file(&conn, path).await.is_ok() {
-            let _ = idx.forget_old_name(&buddy, path);
-        }
-    }
-    if retired > 0 {
-        tracing::info!(buddy = %buddy, files = retired, "whole-file copies retired now that a chunked snapshot holds them");
-        crate::activity::record(
-            crate::activity::kind::BACKUP,
-            Some(&crate::activity::label(&buddy)),
-            format!(
-                "Moved to a chunked backup: {} sent the old way are kept as backup copies for 30 days",
-                crate::activity::plural(retired, "file")
-            ),
-            Vec::new(),
-        );
-    }
 }
 
 /// Most CPUs a backup's rustic threads run on. rustic sizes its thread
@@ -473,12 +332,12 @@ struct Outcome {
     snapshot: Option<SnapshotFile>,
     retention_ran: bool,
     /// What the new snapshot added or changed, and dropped, against its
-    /// parent, for the Activity line (capped like whole-file backups').
+    /// parent, for the Activity line (capped at ACTIVITY_PATHS).
     sent_paths: Vec<String>,
     deleted_paths: Vec<String>,
 }
 
-/// Most paths listed per Activity line (same as whole-file backups).
+/// Most paths listed per Activity line.
 const ACTIVITY_PATHS: usize = 200;
 
 /// Which files the new snapshot added or changed, and which it no longer
@@ -535,9 +394,9 @@ fn snapshot_and_tidy(
     let snapshot = if do_backup {
         let snap = SnapshotOptions::default().host(Some(SNAPSHOT_HOST.to_string())).to_snapshot()?;
         let mut backup_opts = BackupOptions::default();
-        // Compare with the parent snapshot by size and modified time only,
-        // like whole-file backups: inode and ctime aren't stable across a
-        // remount of an SMB/NFS share, and would make every file look new.
+        // Compare with the parent snapshot by size and modified time only:
+        // inode and ctime aren't stable across a remount of an SMB/NFS
+        // share, and would make every file look new.
         backup_opts.parent_opts.ignore_ctime = true;
         backup_opts.parent_opts.ignore_inode = true;
         let source = FilteredSource { root: backup_dir.to_path_buf(), rules };
@@ -643,8 +502,8 @@ impl RusticProgress for CounterProgress {
     fn finish(&self) {}
 }
 
-/// The backup folder as rustic sees it, walked the way whole-file backups
-/// walk it: the exclude list applies, excluded folders aren't opened when
+/// The backup folder as rustic sees it, walked the way the scan
+/// (backup.rs's scan_local_files) walks it: the exclude list applies, excluded folders aren't opened when
 /// no `!` line could bring something back from inside them, and a folder
 /// that can't be read is logged and skipped rather than failing the
 /// snapshot. Sorted by name, which rustic's tree building needs.
